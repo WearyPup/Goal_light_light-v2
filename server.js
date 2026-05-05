@@ -101,12 +101,27 @@ async function nhlGet(path) {
 }
 
 async function getTodaysGame() {
-  const today = new Date().toISOString().split('T')[0];
-  const data  = await nhlGet(`/schedule/${today}`);
-  const games = (data.gameWeek || []).flatMap(d => d.games || []);
+  // Chercher aujourd'hui ET hier (pour les matchs du soir en UTC)
+  const now = new Date();
+  const today = now.toISOString().split('T')[0];
+  const yesterday = new Date(now - 86400000).toISOString().split('T')[0];
+
+  console.log(`[NHL] Recherche: ${yesterday} et ${today}`);
+
+  let games = [];
+  for (const date of [today, yesterday]) {
+    const data = await nhlGet(`/schedule/${date}`);
+    const g = (data.gameWeek || []).flatMap(d => d.games || []);
+    games = games.concat(g);
+  }
+
+  games.forEach(g => console.log(
+    `[NHL] ${g.id} | ${g.awayTeam?.id} vs ${g.homeTeam?.id} | ${g.gameState}`
+  ));
+
   return games.find(g =>
     (g.homeTeam?.id === TEAM_ID || g.awayTeam?.id === TEAM_ID) &&
-    ['LIVE', 'CRIT'].includes(g.gameState)
+    !['OFF', 'FINAL', 'FUT', 'PRE'].includes(g.gameState)
   ) || null;
 }
 
