@@ -11,7 +11,18 @@
  * =====================================================================
  * npm install express axios cors
  */
+app.get('/sync/calc', (req, res) => {
+  const period  = parseInt(req.query.period)  || 1;
+  const tvTime  = req.query.tvTime            || '';
+  const clickMs = parseInt(req.query.clickMs) || Date.now();
 
+  console.log(`[Sync] Reçu — period: ${period} | tvTime: ${tvTime} | clickMs: ${clickMs}`);
+  console.log(`[Sync] now: ${Date.now()} | diff: ${Date.now() - clickMs}ms`);
+  
+  const last = state.timerBuffer[state.timerBuffer.length - 1];
+  console.log(`[Sync] Buffer last — realAt: ${last?.realAt} | time: ${last?.timeInPeriod}`);
+  console.log(`[Sync] click vs buffer: ${clickMs - (last?.realAt || 0)}ms`);
+  
 const express = require('express');
 const axios   = require('axios');
 const cors    = require('cors');
