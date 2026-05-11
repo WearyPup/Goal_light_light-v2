@@ -423,4 +423,3 @@ app.listen(PORT, async () => {
 
   pollingInterval = setInterval(poll, POLL_MS);
 });
-
