@@ -109,6 +109,14 @@ async function getPlayByPlay(gameId) {
 }
 
 // ─── RECONSTRUCTION BUFFER ───────────────────────────────────────────────────
+// Le chrono NHL DESCEND: 20:00 → 0:00
+// Les plays sont dans l'ordre chronologique réel: le premier play a le chrono le plus GRAND
+// realAt croît avec le temps réel, mais timeInPeriod DÉCROÎT
+//
+// Exemple correct:
+//  play[0]: timeInPeriod=19:45, realAt=T+0      (début de période)
+//  play[1]: timeInPeriod=18:32, realAt=T+73000  (73s plus tard)
+//  play[N]: timeInPeriod=00:00, realAt=T+1200000 (fin de période)
 async function rebuildBuffer(gameId) {
   console.log('[Buffer] Reconstruction...');
   try {
@@ -116,66 +124,80 @@ async function rebuildBuffer(gameId) {
     const plays = pbp.plays || [];
     if (!plays.length) return;
 
-    // Prendre TOUS les événements (pas juste les 80 derniers)
-    // pour avoir toute la période courante dans le buffer
-    const now = Date.now();
-
-    // L'API NHL donne les plays dans l'ordre chronologique (du plus ancien au plus récent)
-    // Le dernier play = maintenant - latence API (~8s)
-    // On reconstruit les timestamps en partant du dernier play vers le passé
+    const now            = Date.now();
     const API_LATENCY_MS = 8000;
-    let clockMs = now - API_LATENCY_MS; // timestamp du dernier play
 
-    // Parcourir en sens inverse (du plus récent au plus ancien)
-    // pour assigner des timestamps décroissants
-    const entries = [];
+    // Le DERNIER play correspond à maintenant (- latence API)
+    // On remonte vers le passé en utilisant les différences de chrono de jeu
+    // plays est ordonné du plus ancien (chrono haut) au plus récent (chrono bas)
+
+    // D'abord calculer tous les intervalles entre plays consécutifs
+    // intervalMs[i] = temps réel écoulé entre plays[i] et plays[i+1]
+    const intervalMs = [];
+    for (let i = 0; i < plays.length - 1; i++) {
+      const curr = plays[i];
+      const next = plays[i + 1];
+      const currPeriod = curr.periodDescriptor?.number || 0;
+      const nextPeriod = next.periodDescriptor?.number || 0;
+
+      if (currPeriod === nextPeriod) {
+        const currSecs = parseTime(curr.timeInPeriod || '00:00');
+        const nextSecs = parseTime(next.timeInPeriod || '00:00');
+        // chrono descend: currSecs > nextSecs
+        const gameTimeDiff = (currSecs - nextSecs) * 1000;
+        if (gameTimeDiff > 0 && gameTimeDiff < 120000) {
+          intervalMs.push(gameTimeDiff * 1.2); // +20% pour arrêts de jeu
+        } else {
+          intervalMs.push(4000);
+        }
+      } else {
+        intervalMs.push(4000); // changement de période
+      }
+    }
+
+    // Calculer le timestamp du dernier play = maintenant - latence
+    // Puis remonter vers le passé pour les plays précédents
+    const timestamps = new Array(plays.length);
+    timestamps[plays.length - 1] = now - API_LATENCY_MS;
+    for (let i = plays.length - 2; i >= 0; i--) {
+      timestamps[i] = timestamps[i + 1] - intervalMs[i];
+    }
+
+    // Construire le buffer dans l'ordre chronologique
+    // (plays[0] = plus ancien = realAt le plus petit)
     let clock = false;
-
-    for (let i = plays.length - 1; i >= 0; i--) {
+    for (let i = 0; i < plays.length; i++) {
       const play = plays[i];
       const type = play.typeDescKey || '';
       clock = getClockRunning(type, clock);
-
-      entries.push({
+      pushBuffer({
         timeInPeriod: play.timeInPeriod || '00:00',
         period:       play.periodDescriptor?.number || 0,
-        realAt:       clockMs,
+        realAt:       timestamps[i],
         clockRunning: clock,
         eventType:    type,
         rebuilt:      true,
       });
-
-      // Estimer l'intervalle entre les plays
-      // On utilise la différence de temps de jeu entre les deux plays
-      let intervalMs = 4000; // défaut 4s
-      if (i > 0) {
-        const prevPlay    = plays[i - 1];
-        const currPeriod  = play.periodDescriptor?.number || 0;
-        const prevPeriod  = prevPlay.periodDescriptor?.number || 0;
-        if (currPeriod === prevPeriod) {
-          const currSecs = parseTime(play.timeInPeriod || '00:00');
-          const prevSecs = parseTime(prevPlay.timeInPeriod || '00:00');
-          // chrono descend → currSecs < prevSecs
-          const gameTimeDiff = (prevSecs - currSecs) * 1000;
-          if (gameTimeDiff > 0 && gameTimeDiff < 120000) {
-            // Temps de jeu réel écoulé entre les deux plays
-            // Ajouter overhead pour arrêts de jeu (~20%)
-            intervalMs = gameTimeDiff * 1.2;
-          }
-        }
-      }
-      clockMs -= intervalMs;
     }
 
-    // Remettre dans l'ordre chronologique (plus ancien en premier)
-    entries.reverse();
-    entries.forEach(e => pushBuffer(e));
+    // Tronquer si dépasse BUFFER_MAX
+    if (state.timerBuffer.length > BUFFER_MAX) {
+      state.timerBuffer = state.timerBuffer.slice(-BUFFER_MAX);
+    }
 
-    // Log pour vérifier
+    // Log de vérification
     if (state.timerBuffer.length > 0) {
       const first = state.timerBuffer[0];
       const last  = state.timerBuffer[state.timerBuffer.length - 1];
-      console.log(`[Buffer] ${state.timerBuffer.length} entrées | range: P${first.period} ${first.timeInPeriod}(${first.realAt}) → P${last.period} ${last.timeInPeriod}(${last.realAt})`);
+      console.log(`[Buffer] ${state.timerBuffer.length} entrées`);
+      console.log(`[Buffer] premier: P${first.period} ${first.timeInPeriod} realAt=${first.realAt}`);
+      console.log(`[Buffer] dernier: P${last.period}  ${last.timeInPeriod} realAt=${last.realAt}`);
+      // Vérification: realAt doit croître quand timeInPeriod décroît
+      if (last.realAt > first.realAt) {
+        console.log('[Buffer] ✓ Ordre correct: realAt croissant, chrono décroissant');
+      } else {
+        console.error('[Buffer] ✗ ERREUR: ordre incorrect!');
+      }
     }
   } catch (err) {
     console.error('[Buffer] Erreur:', err.message);
@@ -307,32 +329,45 @@ function calcTvDelay(period, tvTime, clickMsRaw) {
     return { tvDelaySec: 45, confidence: 'low', note: `Aucune entrée P${period}` };
   }
 
-  let entryA = null;
-  let entryB = null;
+  // Le buffer est trié par realAt croissant, et timeInPeriod DÉCROISSANT
+  // (ex: 20:00 → 19:45 → ... → 09:12 → ... → 00:00)
+  // On cherche deux entrées consécutives qui encadrent tvSecs:
+  //   entryBefore: timeInPeriod > tvSecs (avant dans le match, realAt plus petit)
+  //   entryAfter:  timeInPeriod < tvSecs (après dans le match, realAt plus grand)
+
+  let entryBefore = null; // chrono plus grand que tvSecs (réel plus tôt)
+  let entryAfter  = null; // chrono plus petit que tvSecs (réel plus tard)
 
   for (const e of periodBuf) {
     const t = parseTime(e.timeInPeriod);
-    if (t >= tvSecs) entryA = e;
-    if (t <= tvSecs && !entryB) entryB = e;
+    if (t > tvSecs) entryBefore = e;      // garde le plus récent avec t > tvSecs
+    if (t <= tvSecs && !entryAfter) entryAfter = e; // prend le premier avec t <= tvSecs
   }
 
-  console.log(`[Sync Calc] entryA=${entryA?.timeInPeriod}(${entryA?.realAt}) entryB=${entryB?.timeInPeriod}(${entryB?.realAt})`);
+  console.log(`[Sync Calc] entryBefore=${entryBefore?.timeInPeriod}(${entryBefore?.realAt}) entryAfter=${entryAfter?.timeInPeriod}(${entryAfter?.realAt})`);
 
   let realAtMs, note;
 
-  if (entryA && entryA.timeInPeriod === tvTime) {
-    realAtMs = entryA.realAt;
+  if (entryAfter && entryAfter.timeInPeriod === tvTime) {
+    // Correspondance exacte
+    realAtMs = entryAfter.realAt;
     note     = 'exact';
-  } else if (entryA && entryB && entryA.clockRunning && entryB.clockRunning) {
-    const timeA = parseTime(entryA.timeInPeriod);
-    const timeB = parseTime(entryB.timeInPeriod);
-    const denom = timeA - timeB;
-    const ratio = denom > 0 ? (timeA - tvSecs) / denom : 0;
-    realAtMs    = entryA.realAt + ratio * (entryB.realAt - entryA.realAt);
-    note        = 'interpolated';
-  } else if (entryA) {
-    realAtMs = entryA.realAt;
-    note     = entryA.clockRunning ? 'nearest' : 'stoppage';
+  } else if (entryBefore && entryAfter) {
+    // Interpolation linéaire entre les deux entrées encadrantes
+    // entryBefore: chrono plus grand, realAt plus petit
+    // entryAfter:  chrono plus petit, realAt plus grand
+    const timeBefore = parseTime(entryBefore.timeInPeriod);
+    const timeAfter  = parseTime(entryAfter.timeInPeriod);
+    const denom      = timeBefore - timeAfter; // toujours > 0
+    const ratio      = denom > 0 ? (timeBefore - tvSecs) / denom : 0;
+    realAtMs         = entryBefore.realAt + ratio * (entryAfter.realAt - entryBefore.realAt);
+    note             = 'interpolated';
+  } else if (entryAfter) {
+    realAtMs = entryAfter.realAt;
+    note     = entryAfter.clockRunning ? 'nearest' : 'stoppage';
+  } else if (entryBefore) {
+    realAtMs = entryBefore.realAt;
+    note     = 'nearest';
   } else {
     console.warn('[Sync Calc] Temps introuvable dans buffer → 45s');
     return { tvDelaySec: 45, confidence: 'low', note: 'Temps introuvable' };
