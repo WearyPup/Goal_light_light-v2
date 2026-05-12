@@ -383,7 +383,7 @@ app.get('/ping', (req, res) => res.json({ ok: true, time: Date.now() }));
 app.get('/debug/plays', async (req, res) => {
   if (!state.gameId) return res.json({ error: 'Pas de partie' });
   try {
-    const pbp   = await nhlGet(\`/gamecenter/\${state.gameId}/play-by-play\`);
+    const pbp   = await nhlGet(`/gamecenter/${state.gameId}/play-by-play`);
     const plays = pbp.plays || [];
     // Retourner les 3 premiers et 3 derniers plays avec tous leurs champs
     const sample = [
