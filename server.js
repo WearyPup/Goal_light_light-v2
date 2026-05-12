@@ -94,9 +94,23 @@ function resetState() {
 
 
 // ─── RECONSTRUCTION BUFFER DEPUIS HISTORIQUE ────────────────────────────────
+// Principe:
+//   - L'API nous donne tous les plays avec timeInPeriod (temps de jeu)
+//   - On reçoit ces plays maintenant → le DERNIER play = anchorRealAt = now - 5s
+//   - Chaque play précédent a un realAt calculé depuis l'ancre:
+//       realAt(play) = anchorRealAt - (anchorGameSecs - playGameSecs) * 1000
+//   - Le chrono descend donc anchorGameSecs < playGameSecs pour les plays plus tôt
+//   - Exemple: ancre=10:48 (648s), play=14:21 (861s)
+//       realAt = anchorRealAt - (648 - 861) * 1000 = anchorRealAt + 213s → FAUX
+//
+// CORRECTION: le chrono descend → 14:21 EST PLUS TÔT dans le match
+//   temps de jeu avant l'ancre = 861 - 648 = 213s
+//   realAt(14:21) = anchorRealAt - 213s ← 213s AVANT l'ancre ✓
 async function buildBufferFromHistory(plays, currentPeriod) {
   if (!plays || plays.length === 0) return;
   const now = Date.now();
+
+  // Filtrer: période courante uniquement, exclure period-start/end, timeInPeriod > 0
   const pp = plays.filter(p => {
     const per  = p.periodDescriptor?.number || 0;
     const type = p.typeDescKey || '';
@@ -105,42 +119,50 @@ async function buildBufferFromHistory(plays, currentPeriod) {
            !['period-start','period-end','game-start','game-end'].includes(type) &&
            secs > 0;
   });
-  if (pp.length === 0) { console.log('[Buffer] Aucun play historique valide'); return; }
-  // Ancre: le dernier play correspond à now - latence API
-  // On calcule le realAt de chaque play en partant de cette ancre
-  // et en soustrayant la différence de temps de jeu (timeInPeriod).
-  //
-  // timeInPeriod du dernier play = T_last (ex: 10:48 = 648s)
-  // realAt du dernier play = now - 5s
-  // Pour un play à T_x: realAt = (now-5s) - (T_last - T_x) * 1000
-  //   car le chrono est en secondes de jeu et tourne en temps réel quand actif
-  //
-  // Note: ceci suppose que le chrono = temps réel (1s jeu = 1s réel).
-  // Les arrêts ne comptent pas dans timeInPeriod donc c'est exact.
-  // Ancre = dernier play connu = now - 5s
-  // Le chrono NHL DESCEND: 20:00 → 0:00
-  // Un play à 14:21 (861s) est AVANT un play à 10:48 (648s) dans le match
-  // Donc son realAt est PLUS ANCIEN: realAt = anchor - (861 - 648) * 1000
-  //
-  // Formule: gameSecsAgo = playSecs - anchorSecs
-  //   si play plus tôt dans le match (playSecs > anchorSecs): gameSecsAgo > 0 → realAt plus ancien ✓
-  //   si play plus récent (playSecs < anchorSecs): gameSecsAgo < 0 → realAt plus récent ✓
-  const anchorSecs   = toSecs(pp[pp.length - 1].timeInPeriod);
-  const anchorRealAt = now - 5000;
 
-  const ts = new Array(pp.length);
-  for (let i = 0; i < pp.length; i++) {
-    const playSecs    = toSecs(pp[i].timeInPeriod);
-    const gameSecsAgo = playSecs - anchorSecs; // positif = plus tôt dans le match
-    ts[i] = anchorRealAt - (gameSecsAgo * 1000);
+  if (pp.length === 0) {
+    console.log('[Buffer] Pas de plays historiques valides');
+    return;
   }
+
+  // Ancre = dernier play de la liste = le plus récent = now - 5s
+  // Utiliser timeRemaining pour l'ancre — c'est ce que voit l'utilisateur
+  // timeRemaining DESCEND: 20:00 → 0:00 (comme le chrono à la télé)
+  // Le dernier play = plus petit timeRemaining = le plus récent = ancre = now-5s
+  const anchorPlay    = pp[pp.length - 1];
+  const anchorRemSecs = toSecs(anchorPlay.timeRemaining || '00:00');
+  const anchorRealAt  = now - 5000;
+
+  console.log(`[Buffer] Ancre: remaining=${anchorPlay.timeRemaining}(${anchorRemSecs}s) inPeriod=${anchorPlay.timeInPeriod} realAt=${anchorRealAt}`);
+
   let clock = false;
   for (let i = 0; i < pp.length; i++) {
-    clock = clockFor(pp[i].typeDescKey || '', clock);
-    pushBuffer({ period: currentPeriod, timeInPeriod: pp[i].timeInPeriod, realAt: ts[i], clockRunning: clock });
+    const play       = pp[i];
+    const type       = play.typeDescKey || '';
+    const playRemSecs = toSecs(play.timeRemaining || '00:00');
+
+    clock = clockFor(type, clock);
+
+    // timeRemaining descend → playRemSecs > anchorRemSecs = play plus tôt = realAt plus ancien
+    const secsBeforeAnchor = playRemSecs - anchorRemSecs; // positif = plus tôt dans le match
+    const realAt = anchorRealAt - (secsBeforeAnchor * 1000);
+
+    pushBuffer({
+      period:       currentPeriod,
+      timeInPeriod: play.timeInPeriod,
+      timeRemaining: play.timeRemaining || '',
+      realAt,
+      clockRunning: clock,
+    });
   }
-  console.log(`[Buffer] Historique P${currentPeriod}: ${pp.length} entrées | ${pp[0].timeInPeriod} → ${pp[pp.length-1].timeInPeriod}`);
+
+  const first = pp[0];
+  const last  = pp[pp.length - 1];
+  const first = pp[0];
+  const last  = pp[pp.length - 1];
+  console.log(`[Buffer] Historique P${currentPeriod}: ${pp.length} plays | remaining: ${first.timeRemaining} → ${last.timeRemaining}`);
 }
+
 
 // ─── POLLING ─────────────────────────────────────────────────
 async function poll() {
@@ -188,9 +210,10 @@ async function poll() {
 
       state.clockRunning = clockFor(type, state.clockRunning);
 
-      // Ajouter au buffer — exclure period-start/end qui ont 00:00 et faussent la synchro
+      // Ajouter au buffer — exclure period-start/end
       if (!['period-start','period-end','game-start','game-end'].includes(type)) {
-        pushBuffer({ period, timeInPeriod: time, realAt: now, clockRunning: state.clockRunning });
+        const remaining = play.timeRemaining || '';
+        pushBuffer({ period, timeInPeriod: time, timeRemaining: remaining, realAt: now, clockRunning: state.clockRunning });
       }
 
       // Détecter but
@@ -245,66 +268,38 @@ async function poll() {
 function calcDelay(period, tvTime, clickMs) {
   const tvSecs = toSecs(tvTime);
 
-  // Filtrer: bonne période, exclure 00:00 (period-start/end), chrono > 0
+  // Filtrer: bonne période, avoir un timeRemaining valide
   const entries = state.buffer.filter(e =>
-    e.period === period &&
-    toSecs(e.timeInPeriod) > 0
+    e.period === period && e.timeRemaining && toSecs(e.timeRemaining) > 0
   );
 
-  console.log(`[Sync] Calcul: P${period} tvTime=${tvTime}(${tvSecs}s) clickMs=${clickMs}`);
-  console.log(`[Sync] Buffer: ${state.buffer.length} total, ${entries.length} valides P${period}`);
+  console.log(`[Sync] Calcul: P${period} tvTime(remaining)=${tvTime}(${tvSecs}s) clickMs=${clickMs}`);
+  console.log(`[Sync] Buffer: ${state.buffer.length} total, ${entries.length} avec timeRemaining P${period}`);
 
   if (entries.length === 0)
-    return { ok: false, error: `Pas encore de données pour P${period} — patientez` };
+    return { ok: false, error: `Pas de données P${period} — patientez 30s` };
 
-  // Afficher la plage disponible (du plus récent au plus ancien en chrono)
-  const byTime = [...entries].sort((a,b) => toSecs(b.timeInPeriod) - toSecs(a.timeInPeriod));
-  const newest = byTime[0];   // chrono le plus grand = début de période
-  const oldest = byTime[byTime.length-1]; // chrono le plus petit = moment le plus récent
-  console.log(`[Sync] Plage chrono dispo: ${newest.timeInPeriod} → ${oldest.timeInPeriod}`);
+  // Plage disponible en timeRemaining
+  const rSecs = entries.map(e => toSecs(e.timeRemaining));
+  const maxR  = Math.max(...rSecs);
+  const minR  = Math.min(...rSecs);
+  console.log(`[Sync] Plage timeRemaining: ${maxR}s → ${minR}s`);
 
-  // Vérifier que tvTime est dans la plage du buffer
-  const newestSecs = toSecs(newest.timeInPeriod);
-  const oldestSecs = toSecs(oldest.timeInPeriod);
-  if (tvSecs > newestSecs + 30 || tvSecs < oldestSecs - 30) {
-    return { ok: false, error: `${tvTime} hors buffer (dispo: ${oldest.timeInPeriod}–${newest.timeInPeriod}). Synchronisez sur un temps récent.` };
-  }
-
-  // Trouver l'entrée dont le realAt correspond le mieux au clic
-  // Stratégie: pour chaque entrée avec timeInPeriod proche de tvTime,
-  // calculer le délai et prendre celui qui est dans la plage valide [0, 120s]
+  // Trouver l'entrée avec timeRemaining le plus proche de tvTime
   let best     = null;
   let bestDiff = Infinity;
-
   for (const e of entries) {
-    const diff = Math.abs(toSecs(e.timeInPeriod) - tvSecs);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = e;
-    }
+    const diff = Math.abs(toSecs(e.timeRemaining) - tvSecs);
+    if (diff < bestDiff) { bestDiff = diff; best = e; }
   }
 
-  console.log(`[Sync] Meilleure: ${best.timeInPeriod} realAt=${best.realAt} diff=${bestDiff}s`);
+  console.log(`[Sync] Meilleure: remaining=${best.timeRemaining} inPeriod=${best.timeInPeriod} realAt=${best.realAt} diff=${bestDiff}s`);
 
   const delaySec = Math.round((clickMs - best.realAt) / 1000);
   console.log(`[Sync] delaySec=${delaySec}`);
 
-  if (delaySec < 0 || delaySec > 120) {
-    // Essayer avec les 5 entrées les plus proches
-    const candidates = [...entries]
-      .sort((a,b) => Math.abs(toSecs(a.timeInPeriod)-tvSecs) - Math.abs(toSecs(b.timeInPeriod)-tvSecs))
-      .slice(0, 5);
-    console.log('[Sync] Candidats:', candidates.map(e => `${e.timeInPeriod}→${Math.round((clickMs-e.realAt)/1000)}s`).join(', '));
-    // Prendre le premier candidat avec délai valide
-    for (const c of candidates) {
-      const d = Math.round((clickMs - c.realAt) / 1000);
-      if (d >= 0 && d <= 120) {
-        console.log(`[Sync] Candidat valide: ${c.timeInPeriod} → ${d}s`);
-        return { ok: true, tvDelaySec: d, confidence: 'medium', note: `fallback (diff ${Math.abs(toSecs(c.timeInPeriod)-tvSecs)}s)` };
-      }
-    }
-    return { ok: false, error: `Délai calculé hors limites (${delaySec}s) — réessayez dans 30s` };
-  }
+  if (delaySec < 0 || delaySec > 120)
+    return { ok: false, error: `Délai hors limites (${delaySec}s) — réessayez` };
 
   return {
     ok:         true,
