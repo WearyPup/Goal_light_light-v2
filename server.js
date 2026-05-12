@@ -106,12 +106,33 @@ async function buildBufferFromHistory(plays, currentPeriod) {
            secs > 0;
   });
   if (pp.length === 0) { console.log('[Buffer] Aucun play historique valide'); return; }
+  // Ancre: le dernier play correspond à now - latence API
+  // On calcule le realAt de chaque play en partant de cette ancre
+  // et en soustrayant la différence de temps de jeu (timeInPeriod).
+  //
+  // timeInPeriod du dernier play = T_last (ex: 10:48 = 648s)
+  // realAt du dernier play = now - 5s
+  // Pour un play à T_x: realAt = (now-5s) - (T_last - T_x) * 1000
+  //   car le chrono est en secondes de jeu et tourne en temps réel quand actif
+  //
+  // Note: ceci suppose que le chrono = temps réel (1s jeu = 1s réel).
+  // Les arrêts ne comptent pas dans timeInPeriod donc c'est exact.
+  // Ancre = dernier play connu = now - 5s
+  // Le chrono NHL DESCEND: 20:00 → 0:00
+  // Un play à 14:21 (861s) est AVANT un play à 10:48 (648s) dans le match
+  // Donc son realAt est PLUS ANCIEN: realAt = anchor - (861 - 648) * 1000
+  //
+  // Formule: gameSecsAgo = playSecs - anchorSecs
+  //   si play plus tôt dans le match (playSecs > anchorSecs): gameSecsAgo > 0 → realAt plus ancien ✓
+  //   si play plus récent (playSecs < anchorSecs): gameSecsAgo < 0 → realAt plus récent ✓
+  const anchorSecs   = toSecs(pp[pp.length - 1].timeInPeriod);
+  const anchorRealAt = now - 5000;
+
   const ts = new Array(pp.length);
-  ts[pp.length - 1] = now - 5000;
-  for (let i = pp.length - 2; i >= 0; i--) {
-    const diffSecs = toSecs(pp[i].timeInPeriod) - toSecs(pp[i+1].timeInPeriod);
-    const interval = (diffSecs > 0 && diffSecs < 120) ? diffSecs * 1300 : 4000;
-    ts[i] = ts[i+1] - interval;
+  for (let i = 0; i < pp.length; i++) {
+    const playSecs    = toSecs(pp[i].timeInPeriod);
+    const gameSecsAgo = playSecs - anchorSecs; // positif = plus tôt dans le match
+    ts[i] = anchorRealAt - (gameSecsAgo * 1000);
   }
   let clock = false;
   for (let i = 0; i < pp.length; i++) {
@@ -357,6 +378,40 @@ app.post('/config/team', (req, res) => {
 });
 
 app.get('/ping', (req, res) => res.json({ ok: true, time: Date.now() }));
+
+// DEBUG: voir la structure des plays pour trouver les timestamps UTC
+app.get('/debug/plays', async (req, res) => {
+  if (!state.gameId) return res.json({ error: 'Pas de partie' });
+  try {
+    const pbp   = await nhlGet(\`/gamecenter/\${state.gameId}/play-by-play\`);
+    const plays = pbp.plays || [];
+    // Retourner les 3 premiers et 3 derniers plays avec tous leurs champs
+    const sample = [
+      ...plays.slice(0, 3),
+      ...plays.slice(-3),
+    ];
+    res.json({
+      total: plays.length,
+      sample: sample.map(p => ({
+        eventId:      p.eventId,
+        typeDescKey:  p.typeDescKey,
+        timeInPeriod: p.timeInPeriod,
+        period:       p.periodDescriptor?.number,
+        // Chercher tous les champs qui ressemblent à des timestamps
+        allKeys:      Object.keys(p),
+        timeRemaining: p.timeRemaining,
+        situationCode: p.situationCode,
+        // Champs potentiels de timestamp
+        wallClock:    p.wallClock,
+        dateTime:     p.dateTime,
+        timestamp:    p.timestamp,
+        eventDate:    p.eventDate,
+      }))
+    });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
 
 app.post('/test/goal', (req, res) => {
   const fake = {
