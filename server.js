@@ -112,21 +112,31 @@ async function getPlayByPlay(gameId) {
 async function rebuildBuffer(gameId) {
   console.log('[Buffer] Reconstruction...');
   try {
-    const pbp    = await getPlayByPlay(gameId);
-    const plays  = pbp.plays || [];
+    const pbp   = await getPlayByPlay(gameId);
+    const plays = pbp.plays || [];
     if (!plays.length) return;
 
-    const recent = plays.slice(-80);
-    const now    = Date.now();
-    let clockMs  = now - 8000; // Latence API estimée
-    let clock    = false;
+    // Prendre TOUS les événements (pas juste les 80 derniers)
+    // pour avoir toute la période courante dans le buffer
+    const now = Date.now();
 
-    // Reconstruire en sens inverse
-    for (let i = recent.length - 1; i >= 0; i--) {
-      const play = recent[i];
+    // L'API NHL donne les plays dans l'ordre chronologique (du plus ancien au plus récent)
+    // Le dernier play = maintenant - latence API (~8s)
+    // On reconstruit les timestamps en partant du dernier play vers le passé
+    const API_LATENCY_MS = 8000;
+    let clockMs = now - API_LATENCY_MS; // timestamp du dernier play
+
+    // Parcourir en sens inverse (du plus récent au plus ancien)
+    // pour assigner des timestamps décroissants
+    const entries = [];
+    let clock = false;
+
+    for (let i = plays.length - 1; i >= 0; i--) {
+      const play = plays[i];
       const type = play.typeDescKey || '';
       clock = getClockRunning(type, clock);
-      pushBuffer({
+
+      entries.push({
         timeInPeriod: play.timeInPeriod || '00:00',
         period:       play.periodDescriptor?.number || 0,
         realAt:       clockMs,
@@ -134,11 +144,39 @@ async function rebuildBuffer(gameId) {
         eventType:    type,
         rebuilt:      true,
       });
-      clockMs -= 4000;
+
+      // Estimer l'intervalle entre les plays
+      // On utilise la différence de temps de jeu entre les deux plays
+      let intervalMs = 4000; // défaut 4s
+      if (i > 0) {
+        const prevPlay    = plays[i - 1];
+        const currPeriod  = play.periodDescriptor?.number || 0;
+        const prevPeriod  = prevPlay.periodDescriptor?.number || 0;
+        if (currPeriod === prevPeriod) {
+          const currSecs = parseTime(play.timeInPeriod || '00:00');
+          const prevSecs = parseTime(prevPlay.timeInPeriod || '00:00');
+          // chrono descend → currSecs < prevSecs
+          const gameTimeDiff = (prevSecs - currSecs) * 1000;
+          if (gameTimeDiff > 0 && gameTimeDiff < 120000) {
+            // Temps de jeu réel écoulé entre les deux plays
+            // Ajouter overhead pour arrêts de jeu (~20%)
+            intervalMs = gameTimeDiff * 1.2;
+          }
+        }
+      }
+      clockMs -= intervalMs;
     }
 
-    state.timerBuffer.sort((a, b) => a.realAt - b.realAt);
-    console.log(`[Buffer] ${state.timerBuffer.length} entrées reconstruites`);
+    // Remettre dans l'ordre chronologique (plus ancien en premier)
+    entries.reverse();
+    entries.forEach(e => pushBuffer(e));
+
+    // Log pour vérifier
+    if (state.timerBuffer.length > 0) {
+      const first = state.timerBuffer[0];
+      const last  = state.timerBuffer[state.timerBuffer.length - 1];
+      console.log(`[Buffer] ${state.timerBuffer.length} entrées | range: P${first.period} ${first.timeInPeriod}(${first.realAt}) → P${last.period} ${last.timeInPeriod}(${last.realAt})`);
+    }
   } catch (err) {
     console.error('[Buffer] Erreur:', err.message);
   }
