@@ -248,21 +248,24 @@ function resetGame() {
 
 // ─── CALCUL DÉLAI TV ─────────────────────────────────────────────────────────
 function calcTvDelay(period, tvTime, clickMsRaw) {
-  // CORRECTION: détecter si clickMs est en secondes ou millisecondes
   let clickMs = Number(clickMsRaw);
-  if (clickMs < 10000000000) {
-    // Trop petit → probablement en secondes, convertir en ms
-    clickMs = clickMs * 1000;
-    console.log(`[Sync] clickMs converti secondes→ms: ${clickMs}`);
-  }
-
-  console.log(`[Sync Debug] clickMs: ${clickMs} | now: ${Date.now()} | diff: ${Date.now() - clickMs}ms`);
+  if (clickMs < 10000000000) clickMs *= 1000; // secondes → ms
 
   const tvSecs    = parseTime(tvTime);
   const buf       = state.timerBuffer;
   const periodBuf = buf.filter(e => e.period === period);
 
+  // Log buffer pour debug
+  console.log(`[Sync Calc] clickMs=${clickMs} tvTime=${tvTime} tvSecs=${tvSecs} period=${period}`);
+  console.log(`[Sync Calc] buffer total=${buf.length} period_entries=${periodBuf.length}`);
+  if (periodBuf.length > 0) {
+    const first = periodBuf[0];
+    const last  = periodBuf[periodBuf.length - 1];
+    console.log(`[Sync Calc] period buffer range: ${first.timeInPeriod}(${first.realAt}) → ${last.timeInPeriod}(${last.realAt})`);
+  }
+
   if (!periodBuf.length) {
+    console.warn(`[Sync Calc] Aucune entrée pour P${period} → 45s par défaut`);
     return { tvDelaySec: 45, confidence: 'low', note: `Aucune entrée P${period}` };
   }
 
@@ -274,6 +277,8 @@ function calcTvDelay(period, tvTime, clickMsRaw) {
     if (t >= tvSecs) entryA = e;
     if (t <= tvSecs && !entryB) entryB = e;
   }
+
+  console.log(`[Sync Calc] entryA=${entryA?.timeInPeriod}(${entryA?.realAt}) entryB=${entryB?.timeInPeriod}(${entryB?.realAt})`);
 
   let realAtMs, note;
 
@@ -291,6 +296,7 @@ function calcTvDelay(period, tvTime, clickMsRaw) {
     realAtMs = entryA.realAt;
     note     = entryA.clockRunning ? 'nearest' : 'stoppage';
   } else {
+    console.warn('[Sync Calc] Temps introuvable dans buffer → 45s');
     return { tvDelaySec: 45, confidence: 'low', note: 'Temps introuvable' };
   }
 
@@ -298,13 +304,14 @@ function calcTvDelay(period, tvTime, clickMsRaw) {
   const delayMs  = clickMs - realAtMs - HUMAN_REFLEX_MS;
   const delaySec = Math.round(delayMs / 1000);
 
-  console.log(`[Sync] realAtMs: ${realAtMs} | delayMs: ${delayMs} | delaySec: ${delaySec} | mode: ${note}`);
+  console.log(`[Sync Calc] realAtMs=${realAtMs} delayMs=${delayMs} delaySec=${delaySec} note=${note}`);
 
   if (delaySec < 0 || delaySec > 120) {
-    console.warn(`[Sync] Délai hors limites: ${delaySec}s`);
+    console.warn(`[Sync Calc] Hors limites: ${delaySec}s → 45s par défaut`);
     return { tvDelaySec: 45, confidence: 'low', note: `Hors limites: ${delaySec}s` };
   }
 
+  console.log(`[Sync Calc] ✓ Délai TV = ${delaySec}s (${note})`);
   return {
     tvDelaySec:  delaySec,
     confidence:  note === 'exact' ? 'high' : note === 'interpolated' ? 'medium' : 'low',
