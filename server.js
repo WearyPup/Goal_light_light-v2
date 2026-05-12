@@ -137,8 +137,10 @@ async function poll() {
 
       state.clockRunning = clockFor(type, state.clockRunning);
 
-      // Ajouter au buffer avec timestamp réel
-      pushBuffer({ period, timeInPeriod: time, realAt: now, clockRunning: state.clockRunning });
+      // Ajouter au buffer — exclure period-start/end qui ont 00:00 et faussent la synchro
+      if (!['period-start','period-end','game-start','game-end'].includes(type)) {
+        pushBuffer({ period, timeInPeriod: time, realAt: now, clockRunning: state.clockRunning });
+      }
 
       // Détecter but
       if (type === 'goal' && play.eventId !== state.lastGoalEventId) {
@@ -159,7 +161,8 @@ async function poll() {
     // Interpolation si jeu en cours et pas de nouveaux events
     if (state.clockRunning && newPlays.length === 0 && state.buffer.length > 0) {
       const last = state.buffer[state.buffer.length - 1];
-      if (last.clockRunning && last.period === state.period) {
+      // Seulement interpoler si le dernier event a un chrono valide (> 00:00)
+      if (last.clockRunning && last.period === state.period && toSecs(last.timeInPeriod) > 0) {
         const elapsed = Math.floor((now - last.realAt) / 1000);
         if (elapsed > 0) {
           const newSecs = Math.max(0, toSecs(last.timeInPeriod) - elapsed);
@@ -189,45 +192,74 @@ async function poll() {
 // de tvTime pour la bonne période, puis calculer la différence
 // avec clickMs.
 function calcDelay(period, tvTime, clickMs) {
-  const tvSecs  = toSecs(tvTime);
-  const entries = state.buffer.filter(e => e.period === period);
+  const tvSecs = toSecs(tvTime);
+
+  // Filtrer: bonne période, exclure 00:00 (period-start/end), chrono > 0
+  const entries = state.buffer.filter(e =>
+    e.period === period &&
+    toSecs(e.timeInPeriod) > 0
+  );
 
   console.log(`[Sync] Calcul: P${period} tvTime=${tvTime}(${tvSecs}s) clickMs=${clickMs}`);
-  console.log(`[Sync] Buffer: ${state.buffer.length} total, ${entries.length} pour P${period}`);
+  console.log(`[Sync] Buffer: ${state.buffer.length} total, ${entries.length} valides P${period}`);
 
-  if (entries.length === 0) return { ok: false, error: `Pas de données P${period}` };
+  if (entries.length === 0)
+    return { ok: false, error: `Pas encore de données pour P${period} — patientez` };
 
-  const first = entries[0];
-  const last  = entries[entries.length - 1];
-  console.log(`[Sync] Plage buffer P${period}: ${first.timeInPeriod} → ${last.timeInPeriod}`);
+  // Afficher la plage disponible (du plus récent au plus ancien en chrono)
+  const byTime = [...entries].sort((a,b) => toSecs(b.timeInPeriod) - toSecs(a.timeInPeriod));
+  const newest = byTime[0];   // chrono le plus grand = début de période
+  const oldest = byTime[byTime.length-1]; // chrono le plus petit = moment le plus récent
+  console.log(`[Sync] Plage chrono dispo: ${newest.timeInPeriod} → ${oldest.timeInPeriod}`);
 
-  // Trouver l'entrée la plus proche de tvSecs
+  // Vérifier que tvTime est dans la plage du buffer
+  const newestSecs = toSecs(newest.timeInPeriod);
+  const oldestSecs = toSecs(oldest.timeInPeriod);
+  if (tvSecs > newestSecs + 30 || tvSecs < oldestSecs - 30) {
+    return { ok: false, error: `${tvTime} hors buffer (dispo: ${oldest.timeInPeriod}–${newest.timeInPeriod}). Synchronisez sur un temps récent.` };
+  }
+
+  // Trouver l'entrée dont le realAt correspond le mieux au clic
+  // Stratégie: pour chaque entrée avec timeInPeriod proche de tvTime,
+  // calculer le délai et prendre celui qui est dans la plage valide [0, 120s]
   let best     = null;
   let bestDiff = Infinity;
+
   for (const e of entries) {
     const diff = Math.abs(toSecs(e.timeInPeriod) - tvSecs);
-    if (diff < bestDiff) { bestDiff = diff; best = e; }
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = e;
+    }
   }
 
-  console.log(`[Sync] Meilleure entrée: ${best.timeInPeriod} realAt=${best.realAt} diff=${bestDiff}s`);
-
-  // Si trop loin → pas dans le buffer
-  if (bestDiff > 90) {
-    return { ok: false, error: `${tvTime} hors du buffer (entrée la plus proche: ${best.timeInPeriod})` };
-  }
+  console.log(`[Sync] Meilleure: ${best.timeInPeriod} realAt=${best.realAt} diff=${bestDiff}s`);
 
   const delaySec = Math.round((clickMs - best.realAt) / 1000);
   console.log(`[Sync] delaySec=${delaySec}`);
 
   if (delaySec < 0 || delaySec > 120) {
-    return { ok: false, error: `Délai hors limites: ${delaySec}s` };
+    // Essayer avec les 5 entrées les plus proches
+    const candidates = [...entries]
+      .sort((a,b) => Math.abs(toSecs(a.timeInPeriod)-tvSecs) - Math.abs(toSecs(b.timeInPeriod)-tvSecs))
+      .slice(0, 5);
+    console.log('[Sync] Candidats:', candidates.map(e => `${e.timeInPeriod}→${Math.round((clickMs-e.realAt)/1000)}s`).join(', '));
+    // Prendre le premier candidat avec délai valide
+    for (const c of candidates) {
+      const d = Math.round((clickMs - c.realAt) / 1000);
+      if (d >= 0 && d <= 120) {
+        console.log(`[Sync] Candidat valide: ${c.timeInPeriod} → ${d}s`);
+        return { ok: true, tvDelaySec: d, confidence: 'medium', note: `fallback (diff ${Math.abs(toSecs(c.timeInPeriod)-tvSecs)}s)` };
+      }
+    }
+    return { ok: false, error: `Délai calculé hors limites (${delaySec}s) — réessayez dans 30s` };
   }
 
   return {
     ok:         true,
     tvDelaySec: delaySec,
-    confidence: bestDiff <= 10 ? 'high' : bestDiff <= 30 ? 'medium' : 'low',
-    note:       `nearest (diff ${bestDiff}s)`,
+    confidence: bestDiff <= 5 ? 'high' : bestDiff <= 20 ? 'medium' : 'low',
+    note:       `diff ${bestDiff}s`,
   };
 }
 
