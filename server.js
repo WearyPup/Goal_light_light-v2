@@ -331,9 +331,26 @@ app.get('/poll', (req, res) => {
 
 // Calcul délai TV
 app.get('/sync/calc', (req, res) => {
-  const period  = parseInt(req.query.period) || 1;
-  const tvTime  = req.query.tvTime || '';
-  const clickMs = req.query.clickMs;
+  const period      = parseInt(req.query.period) || 1;
+  const tvTime      = req.query.tvTime || '';
+  const clickMsRaw  = req.query.clickMs;
+  const clickMsNum  = Number(clickMsRaw);
+  const nowMs       = Date.now();
+
+  // ── DEBUG ──
+  const last = state.timerBuffer[state.timerBuffer.length - 1];
+  console.log('\n[Sync Debug] ===========================');
+  console.log(`[Sync Debug] period=${period} tvTime=${tvTime}`);
+  console.log(`[Sync Debug] clickMs_raw=${clickMsRaw}`);
+  console.log(`[Sync Debug] clickMs_number=${clickMsNum}`);
+  console.log(`[Sync Debug] now=${nowMs}`);
+  console.log(`[Sync Debug] diff_click_vs_now=${nowMs - clickMsNum}ms`);
+  console.log(`[Sync Debug] buffer_size=${state.timerBuffer.length}`);
+  if (last) {
+    console.log(`[Sync Debug] last_entry: time=${last.timeInPeriod} period=${last.period} realAt=${last.realAt}`);
+    console.log(`[Sync Debug] diff_click_vs_lastRealAt=${clickMsNum - last.realAt}ms`);
+  }
+  console.log('[Sync Debug] ===========================\n');
 
   if (!tvTime.match(/^\d{1,2}:\d{2}$/))
     return res.status(400).json({ ok: false, error: 'tvTime invalide' });
@@ -341,7 +358,7 @@ app.get('/sync/calc', (req, res) => {
   if (!state.gameId)
     return res.json({ ok: false, error: 'Aucune partie', tvDelaySec: 45 });
 
-  const result = calcTvDelay(period, tvTime, clickMs || Date.now());
+  const result = calcTvDelay(period, tvTime, clickMsRaw || nowMs);
   res.json({ ok: true, ...result });
 });
 
