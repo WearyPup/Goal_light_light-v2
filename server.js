@@ -109,96 +109,61 @@ async function getPlayByPlay(gameId) {
 }
 
 // ─── RECONSTRUCTION BUFFER ───────────────────────────────────────────────────
-// Le chrono NHL DESCEND: 20:00 → 0:00
-// Les plays sont dans l'ordre chronologique réel: le premier play a le chrono le plus GRAND
-// realAt croît avec le temps réel, mais timeInPeriod DÉCROÎT
-//
-// Exemple correct:
-//  play[0]: timeInPeriod=19:45, realAt=T+0      (début de période)
-//  play[1]: timeInPeriod=18:32, realAt=T+73000  (73s plus tard)
-//  play[N]: timeInPeriod=00:00, realAt=T+1200000 (fin de période)
+// On reconstruit uniquement pour détecter les buts manqués au réveil.
+// Pour la synchro TV, on utilise UNIQUEMENT les événements reçus en temps réel
+// car les timestamps reconstruits sont trop approximatifs.
 async function rebuildBuffer(gameId) {
-  console.log('[Buffer] Reconstruction...');
+  console.log('[Buffer] Reconstruction minimale (buts uniquement)...');
   try {
     const pbp   = await getPlayByPlay(gameId);
     const plays = pbp.plays || [];
     if (!plays.length) return;
 
-    const now            = Date.now();
-    const API_LATENCY_MS = 8000;
+    // Mettre à jour l'état de base
+    state.homeScore = pbp.homeTeam?.score ?? state.homeScore;
+    state.awayScore = pbp.awayTeam?.score ?? state.awayScore;
+    state.period    = pbp.periodDescriptor?.number ?? state.period;
 
-    // Le DERNIER play correspond à maintenant (- latence API)
-    // On remonte vers le passé en utilisant les différences de chrono de jeu
-    // plays est ordonné du plus ancien (chrono haut) au plus récent (chrono bas)
+    // Mémoriser le dernier eventId pour que poll() continue depuis là
+    const lastPlay = plays[plays.length - 1];
+    if (lastPlay) {
+      state.lastEventId  = lastPlay.eventId;
+      state.clockRunning = getClockRunning(lastPlay.typeDescKey || '', false);
+    }
 
-    // D'abord calculer tous les intervalles entre plays consécutifs
-    // intervalMs[i] = temps réel écoulé entre plays[i] et plays[i+1]
-    const intervalMs = [];
-    for (let i = 0; i < plays.length - 1; i++) {
-      const curr = plays[i];
-      const next = plays[i + 1];
-      const currPeriod = curr.periodDescriptor?.number || 0;
-      const nextPeriod = next.periodDescriptor?.number || 0;
-
-      if (currPeriod === nextPeriod) {
-        const currSecs = parseTime(curr.timeInPeriod || '00:00');
-        const nextSecs = parseTime(next.timeInPeriod || '00:00');
-        // chrono descend: currSecs > nextSecs
-        const gameTimeDiff = (currSecs - nextSecs) * 1000;
-        if (gameTimeDiff > 0 && gameTimeDiff < 120000) {
-          intervalMs.push(gameTimeDiff * 1.2); // +20% pour arrêts de jeu
-        } else {
-          intervalMs.push(4000);
-        }
-      } else {
-        intervalMs.push(4000); // changement de période
+    // Vérifier les buts récents (5 derniers plays)
+    const now = Date.now();
+    for (const play of plays.slice(-5)) {
+      if (play.typeDescKey === 'goal' && play.eventId !== state.lastGoalEventId) {
+        const scoringTeamId = parseInt(play.details?.eventOwnerTeamId);
+        const isOurTeam     = scoringTeamId === parseInt(TEAM_ID);
+        state.lastGoalEventId = play.eventId;
+        state.goals.push({
+          eventId: play.eventId, scoringTeamId, isOurTeam,
+          period: play.periodDescriptor?.number || state.period,
+          timeInPeriod: play.timeInPeriod || '00:00',
+          homeScore: state.homeScore, awayScore: state.awayScore,
+          detectedAt: now,
+        });
+        console.log(`[Buffer] But trouvé au réveil: équipe ${scoringTeamId} isOurTeam=${isOurTeam}`);
       }
     }
 
-    // Calculer le timestamp du dernier play = maintenant - latence
-    // Puis remonter vers le passé pour les plays précédents
-    const timestamps = new Array(plays.length);
-    timestamps[plays.length - 1] = now - API_LATENCY_MS;
-    for (let i = plays.length - 2; i >= 0; i--) {
-      timestamps[i] = timestamps[i + 1] - intervalMs[i];
-    }
-
-    // Construire le buffer dans l'ordre chronologique
-    // (plays[0] = plus ancien = realAt le plus petit)
-    let clock = false;
-    for (let i = 0; i < plays.length; i++) {
-      const play = plays[i];
-      const type = play.typeDescKey || '';
-      clock = getClockRunning(type, clock);
+    // Ajouter UNE seule entrée dans le buffer — le dernier événement connu
+    // Le polling en temps réel va remplir le buffer correctement dès maintenant
+    if (lastPlay) {
       pushBuffer({
-        timeInPeriod: play.timeInPeriod || '00:00',
-        period:       play.periodDescriptor?.number || 0,
-        realAt:       timestamps[i],
-        clockRunning: clock,
-        eventType:    type,
+        timeInPeriod: lastPlay.timeInPeriod || '00:00',
+        period:       lastPlay.periodDescriptor?.number || state.period,
+        realAt:       now - 8000,
+        clockRunning: state.clockRunning,
+        eventType:    lastPlay.typeDescKey || '',
         rebuilt:      true,
       });
     }
 
-    // Tronquer si dépasse BUFFER_MAX
-    if (state.timerBuffer.length > BUFFER_MAX) {
-      state.timerBuffer = state.timerBuffer.slice(-BUFFER_MAX);
-    }
-
-    // Log de vérification
-    if (state.timerBuffer.length > 0) {
-      const first = state.timerBuffer[0];
-      const last  = state.timerBuffer[state.timerBuffer.length - 1];
-      console.log(`[Buffer] ${state.timerBuffer.length} entrées`);
-      console.log(`[Buffer] premier: P${first.period} ${first.timeInPeriod} realAt=${first.realAt}`);
-      console.log(`[Buffer] dernier: P${last.period}  ${last.timeInPeriod} realAt=${last.realAt}`);
-      // Vérification: realAt doit croître quand timeInPeriod décroît
-      if (last.realAt > first.realAt) {
-        console.log('[Buffer] ✓ Ordre correct: realAt croissant, chrono décroissant');
-      } else {
-        console.error('[Buffer] ✗ ERREUR: ordre incorrect!');
-      }
-    }
+    console.log(`[Buffer] Prêt — polling temps réel démarré depuis ${lastPlay?.timeInPeriod} P${state.period}`);
+    console.log('[Buffer] ⚠ Synchro TV disponible seulement après ~2 minutes de polling');
   } catch (err) {
     console.error('[Buffer] Erreur:', err.message);
   }
@@ -437,6 +402,14 @@ app.get('/sync/calc', (req, res) => {
 
   if (!state.gameId)
     return res.json({ ok: false, error: 'Aucune partie', tvDelaySec: 45 });
+
+  // Buffer doit avoir assez d'entrées en temps réel (min 30 = ~1 minute)
+  const realtimeEntries = state.timerBuffer.filter(e => !e.rebuilt);
+  if (realtimeEntries.length < 30) {
+    const wait = Math.ceil((30 - realtimeEntries.length) / 2);
+    console.log(`[Sync] Buffer insuffisant: ${realtimeEntries.length} entrées temps réel`);
+    return res.json({ ok: false, error: `Buffer en cours de remplissage, réessayez dans ~${wait}s`, tvDelaySec: 45 });
+  }
 
   const result = calcTvDelay(period, tvTime, clickMsRaw || nowMs);
   res.json({ ok: true, ...result });
