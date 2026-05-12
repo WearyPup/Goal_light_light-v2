@@ -156,11 +156,7 @@ async function buildBufferFromHistory(plays, currentPeriod) {
     });
   }
 
-  const first = pp[0];
-  const last  = pp[pp.length - 1];
-  const first = pp[0];
-  const last  = pp[pp.length - 1];
-  console.log(`[Buffer] Historique P${currentPeriod}: ${pp.length} plays | remaining: ${first.timeRemaining} → ${last.timeRemaining}`);
+  console.log(`[Buffer] Historique P${currentPeriod}: ${pp.length} plays | remaining: ${pp[0].timeRemaining} → ${pp[pp.length-1].timeRemaining}`);
 }
 
 
