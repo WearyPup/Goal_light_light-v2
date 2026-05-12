@@ -92,6 +92,35 @@ function resetState() {
   });
 }
 
+
+// ─── RECONSTRUCTION BUFFER DEPUIS HISTORIQUE ────────────────────────────────
+async function buildBufferFromHistory(plays, currentPeriod) {
+  if (!plays || plays.length === 0) return;
+  const now = Date.now();
+  const pp = plays.filter(p => {
+    const per  = p.periodDescriptor?.number || 0;
+    const type = p.typeDescKey || '';
+    const secs = toSecs(p.timeInPeriod || '00:00');
+    return per === currentPeriod &&
+           !['period-start','period-end','game-start','game-end'].includes(type) &&
+           secs > 0;
+  });
+  if (pp.length === 0) { console.log('[Buffer] Aucun play historique valide'); return; }
+  const ts = new Array(pp.length);
+  ts[pp.length - 1] = now - 5000;
+  for (let i = pp.length - 2; i >= 0; i--) {
+    const diffSecs = toSecs(pp[i].timeInPeriod) - toSecs(pp[i+1].timeInPeriod);
+    const interval = (diffSecs > 0 && diffSecs < 120) ? diffSecs * 1300 : 4000;
+    ts[i] = ts[i+1] - interval;
+  }
+  let clock = false;
+  for (let i = 0; i < pp.length; i++) {
+    clock = clockFor(pp[i].typeDescKey || '', clock);
+    pushBuffer({ period: currentPeriod, timeInPeriod: pp[i].timeInPeriod, realAt: ts[i], clockRunning: clock });
+  }
+  console.log(`[Buffer] Historique P${currentPeriod}: ${pp.length} entrées | ${pp[0].timeInPeriod} → ${pp[pp.length-1].timeInPeriod}`);
+}
+
 // ─── POLLING ─────────────────────────────────────────────────
 async function poll() {
   try {
@@ -113,6 +142,7 @@ async function poll() {
         state.clockRunning = clockFor(plays[plays.length - 1].typeDescKey || '', false);
       }
       console.log(`[NHL] Reprise depuis P${state.period} | lastEventId=${state.lastEventId}`);
+      await buildBufferFromHistory(plays, state.period);
       return;
     }
 
