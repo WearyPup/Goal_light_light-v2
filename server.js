@@ -1,13 +1,19 @@
 /**
- * GOAL LIGHT — Serveur Node.js v4.0
- * =====================================================================
- * - TEAM_ID configurable via /config (sauvegardé en mémoire)
- * - Détection but corrigée (parseInt pour comparaison)
- * - clickMs corrigé (détection secondes vs millisecondes)
- * - Buffer timer avec horodatage réel UTC
- * - Reconstruction buffer au réveil Render
- * - Compatible GitHub → Render (npm start)
- * =====================================================================
+ * GOAL LIGHT SERVER v5.0
+ * =============================================================
+ * Principe de la synchro TV:
+ *
+ *  - Poll API NHL toutes les 2s → chaque événement stocké avec
+ *    timeInPeriod + realAt (Date.now() au moment de la réception)
+ *  - Le chrono NHL DESCEND: 20:00 → 0:00
+ *  - Quand l'utilisateur fait SYNCHRO:
+ *      clickMs = Date.now() sur son téléphone
+ *      tvTime  = chrono vu à la télé ("14:23")
+ *      period  = période
+ *  - On cherche l'entrée du buffer dont timeInPeriod est la plus
+ *    proche de tvTime
+ *  - delayTV = clickMs - realAt_de_cette_entrée
+ * =============================================================
  */
 
 const express = require('express');
@@ -18,449 +24,284 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── CONFIG ──────────────────────────────────────────────────────────────────
-const PORT       = process.env.PORT || 3000;
-const POLL_MS    = 2000;
-const BUFFER_MAX = 150;
-const NHL_API    = 'https://api-web.nhle.com/v1';
+const PORT    = process.env.PORT || 3000;
+const NHL_API = 'https://api-web.nhle.com/v1';
 
-// TEAM_ID configurable depuis l'app (défaut = 8 Canadiens)
-// Peut être changé via POST /config/team sans redéployer
 let TEAM_ID = parseInt(process.env.TEAM_ID || '8');
 
-// ─── ÉVÉNEMENTS CHRONO ───────────────────────────────────────────────────────
-const CLOCK_STOP  = new Set(['stoppage','goal','penalty','period-end','period-start','game-end']);
-const CLOCK_START = new Set(['faceoff']);
-
-// ─── ÉTAT ────────────────────────────────────────────────────────────────────
+// ─── ÉTAT ────────────────────────────────────────────────────
 const state = {
   gameId:          null,
-  gameState:       'IDLE',
   period:          0,
   homeScore:       0,
   awayScore:       0,
-  homeTeamId:      null,
-  awayTeamId:      null,
   clockRunning:    false,
-  timerBuffer:     [],
-  goals:           [],
-  lastGoalEventId: null,
   lastEventId:     null,
-  lastPollAt:      0,
+  lastGoalEventId: null,
+  goals:           [],
+  buffer:          [], // { period, timeInPeriod, realAt, clockRunning }
 };
 
-let pollingInterval = null;
-
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-function parseTime(t) {
-  if (!t) return 0;
-  const parts = t.split(':').map(Number);
-  return parts[0] * 60 + (parts[1] || 0);
-}
-
-function formatTime(secs) {
-  const m = Math.floor(Math.abs(secs) / 60);
-  const s = Math.abs(secs) % 60;
-  return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+// ─── HELPERS ─────────────────────────────────────────────────
+function toSecs(t) {
+  if (!t) return -1;
+  const [m, s] = t.split(':').map(Number);
+  return m * 60 + (s || 0);
 }
 
 function pushBuffer(entry) {
-  state.timerBuffer.push(entry);
-  if (state.timerBuffer.length > BUFFER_MAX) state.timerBuffer.shift();
+  state.buffer.push(entry);
+  if (state.buffer.length > 300) state.buffer.shift();
 }
 
-function getClockRunning(type, current) {
-  if (CLOCK_START.has(type)) return true;
-  if (CLOCK_STOP.has(type))  return false;
-  return current;
+function clockFor(type, prev) {
+  if (type === 'faceoff') return true;
+  if (['stoppage','goal','penalty','period-end','period-start','game-end'].includes(type)) return false;
+  return prev;
 }
 
-// ─── NHL API ─────────────────────────────────────────────────────────────────
 async function nhlGet(path) {
   const { data } = await axios.get(`${NHL_API}${path}`, { timeout: 8000 });
   return data;
 }
 
-async function getTodaysGame() {
-  const now       = new Date();
-  const today     = now.toISOString().split('T')[0];
-  const yesterday = new Date(now - 86400000).toISOString().split('T')[0];
-
-  let games = [];
-  for (const date of [today, yesterday]) {
+// ─── TROUVER LA PARTIE ───────────────────────────────────────
+async function findGame() {
+  const now   = new Date();
+  const today = now.toISOString().slice(0, 10);
+  const yest  = new Date(now - 86400000).toISOString().slice(0, 10);
+  let games   = [];
+  for (const d of [today, yest]) {
     try {
-      const data = await nhlGet(`/schedule/${date}`);
-      const g    = (data.gameWeek || []).flatMap(d => d.games || []);
-      games      = games.concat(g);
+      const data = await nhlGet(`/schedule/${d}`);
+      games = games.concat((data.gameWeek || []).flatMap(w => w.games || []));
     } catch(e) {}
   }
-
-  // Log toutes les parties trouvées
-  games.forEach(g => console.log(`[NHL] ${g.id} | ${g.awayTeam?.id} vs ${g.homeTeam?.id} | ${g.gameState}`));
-
   return games.find(g =>
     (g.homeTeam?.id === TEAM_ID || g.awayTeam?.id === TEAM_ID) &&
-    !['OFF', 'FINAL', 'FUT', 'PRE'].includes(g.gameState)
+    !['OFF','FINAL','FUT','PRE'].includes(g.gameState)
   ) || null;
 }
 
-async function getPlayByPlay(gameId) {
-  return await nhlGet(`/gamecenter/${gameId}/play-by-play`);
+// ─── RESET ───────────────────────────────────────────────────
+function resetState() {
+  Object.assign(state, {
+    gameId: null, period: 0, homeScore: 0, awayScore: 0,
+    clockRunning: false, lastEventId: null, lastGoalEventId: null,
+    goals: [], buffer: [],
+  });
 }
 
-// ─── RECONSTRUCTION BUFFER ───────────────────────────────────────────────────
-// On reconstruit uniquement pour détecter les buts manqués au réveil.
-// Pour la synchro TV, on utilise UNIQUEMENT les événements reçus en temps réel
-// car les timestamps reconstruits sont trop approximatifs.
-async function rebuildBuffer(gameId) {
-  console.log('[Buffer] Reconstruction minimale (buts uniquement)...');
+// ─── POLLING ─────────────────────────────────────────────────
+async function poll() {
   try {
-    const pbp   = await getPlayByPlay(gameId);
-    const plays = pbp.plays || [];
-    if (!plays.length) return;
-
-    // Mettre à jour l'état de base
-    state.homeScore = pbp.homeTeam?.score ?? state.homeScore;
-    state.awayScore = pbp.awayTeam?.score ?? state.awayScore;
-    state.period    = pbp.periodDescriptor?.number ?? state.period;
-
-    // Mémoriser le dernier eventId pour que poll() continue depuis là
-    const lastPlay = plays[plays.length - 1];
-    if (lastPlay) {
-      state.lastEventId  = lastPlay.eventId;
-      state.clockRunning = getClockRunning(lastPlay.typeDescKey || '', false);
+    if (!state.gameId) {
+      const game = await findGame();
+      if (!game) return;
+      state.gameId    = game.id;
+      state.homeScore = game.homeTeam?.score || 0;
+      state.awayScore = game.awayTeam?.score || 0;
+      console.log(`[NHL] Partie: ${state.gameId} (équipe ${TEAM_ID})`);
+      // Mémoriser le dernier eventId pour ne traiter que les nouveaux events
+      const pbp   = await nhlGet(`/gamecenter/${state.gameId}/play-by-play`);
+      const plays = pbp.plays || [];
+      state.period    = pbp.periodDescriptor?.number || 0;
+      state.homeScore = pbp.homeTeam?.score ?? state.homeScore;
+      state.awayScore = pbp.awayTeam?.score ?? state.awayScore;
+      if (plays.length) {
+        state.lastEventId  = plays[plays.length - 1].eventId;
+        state.clockRunning = clockFor(plays[plays.length - 1].typeDescKey || '', false);
+      }
+      console.log(`[NHL] Reprise depuis P${state.period} | lastEventId=${state.lastEventId}`);
+      return;
     }
 
-    // Vérifier les buts récents (5 derniers plays)
-    const now = Date.now();
-    for (const play of plays.slice(-5)) {
-      if (play.typeDescKey === 'goal' && play.eventId !== state.lastGoalEventId) {
+    const pbp   = await nhlGet(`/gamecenter/${state.gameId}/play-by-play`);
+    const plays = pbp.plays || [];
+    const now   = Date.now();
+
+    state.period    = pbp.periodDescriptor?.number ?? state.period;
+    state.homeScore = pbp.homeTeam?.score           ?? state.homeScore;
+    state.awayScore = pbp.awayTeam?.score           ?? state.awayScore;
+
+    // Extraire seulement les nouveaux plays depuis le dernier poll
+    const lastIdx  = state.lastEventId
+      ? plays.findIndex(p => p.eventId === state.lastEventId)
+      : -1;
+    const newPlays = lastIdx >= 0 ? plays.slice(lastIdx + 1) : [];
+
+    for (const play of newPlays) {
+      const type   = play.typeDescKey || '';
+      const period = play.periodDescriptor?.number || state.period;
+      const time   = play.timeInPeriod || '00:00';
+
+      state.clockRunning = clockFor(type, state.clockRunning);
+
+      // Ajouter au buffer avec timestamp réel
+      pushBuffer({ period, timeInPeriod: time, realAt: now, clockRunning: state.clockRunning });
+
+      // Détecter but
+      if (type === 'goal' && play.eventId !== state.lastGoalEventId) {
         const scoringTeamId = parseInt(play.details?.eventOwnerTeamId);
         const isOurTeam     = scoringTeamId === parseInt(TEAM_ID);
         state.lastGoalEventId = play.eventId;
         state.goals.push({
           eventId: play.eventId, scoringTeamId, isOurTeam,
-          period: play.periodDescriptor?.number || state.period,
-          timeInPeriod: play.timeInPeriod || '00:00',
+          period, timeInPeriod: time, detectedAt: now,
           homeScore: state.homeScore, awayScore: state.awayScore,
-          detectedAt: now,
         });
-        console.log(`[Buffer] But trouvé au réveil: équipe ${scoringTeamId} isOurTeam=${isOurTeam}`);
-      }
-    }
-
-    // Ajouter UNE seule entrée dans le buffer — le dernier événement connu
-    // Le polling en temps réel va remplir le buffer correctement dès maintenant
-    if (lastPlay) {
-      pushBuffer({
-        timeInPeriod: lastPlay.timeInPeriod || '00:00',
-        period:       lastPlay.periodDescriptor?.number || state.period,
-        realAt:       now - 8000,
-        clockRunning: state.clockRunning,
-        eventType:    lastPlay.typeDescKey || '',
-        rebuilt:      true,
-      });
-    }
-
-    console.log(`[Buffer] Prêt — polling temps réel démarré depuis ${lastPlay?.timeInPeriod} P${state.period}`);
-    console.log('[Buffer] ⚠ Synchro TV disponible seulement après ~2 minutes de polling');
-  } catch (err) {
-    console.error('[Buffer] Erreur:', err.message);
-  }
-}
-
-// ─── POLLING ─────────────────────────────────────────────────────────────────
-async function poll() {
-  try {
-    const now = Date.now();
-
-    if (!state.gameId) {
-      const game = await getTodaysGame();
-      if (!game) return;
-      state.gameId     = game.id;
-      state.gameState  = 'LIVE';
-      state.homeTeamId = game.homeTeam?.id;
-      state.awayTeamId = game.awayTeam?.id;
-      state.homeScore  = game.homeTeam?.score || 0;
-      state.awayScore  = game.awayTeam?.score || 0;
-      console.log(`[NHL] Partie trouvée: ${state.gameId} (équipe ${TEAM_ID})`);
-      await rebuildBuffer(state.gameId);
-      return;
-    }
-
-    const pbp   = await getPlayByPlay(state.gameId);
-    const plays = pbp.plays || [];
-
-    state.homeScore = pbp.homeTeam?.score  ?? state.homeScore;
-    state.awayScore = pbp.awayTeam?.score  ?? state.awayScore;
-    state.period    = pbp.periodDescriptor?.number ?? state.period;
-
-    const lastIdx  = state.lastEventId
-      ? plays.findIndex(p => p.eventId === state.lastEventId)
-      : -1;
-    const newPlays = lastIdx >= 0 ? plays.slice(lastIdx + 1) : plays.slice(-5);
-
-    for (const play of newPlays) {
-      const type         = play.typeDescKey || '';
-      const period       = play.periodDescriptor?.number || state.period;
-      const timeInPeriod = play.timeInPeriod || '00:00';
-
-      state.clockRunning = getClockRunning(type, state.clockRunning);
-
-      pushBuffer({ timeInPeriod, period, realAt: now, clockRunning: state.clockRunning, eventType: type });
-
-      // ── Détection but ──
-      if (type === 'goal' && play.eventId !== state.lastGoalEventId) {
-        // CORRECTION: parseInt pour s'assurer que la comparaison est numérique
-        const scoringTeamId = parseInt(play.details?.eventOwnerTeamId);
-        const isOurTeam     = scoringTeamId === parseInt(TEAM_ID);
-
-        state.lastGoalEventId = play.eventId;
-        const goal = {
-          eventId: play.eventId,
-          scoringTeamId,
-          isOurTeam,
-          period,
-          timeInPeriod,
-          homeScore: state.homeScore,
-          awayScore: state.awayScore,
-          detectedAt: now,
-        };
-        state.goals.push(goal);
-        console.log(`[GOAL] But! Équipe ${scoringTeamId} | Notre équipe: ${isOurTeam} | ${timeInPeriod} P${period}`);
+        console.log(`[GOAL] Équipe ${scoringTeamId} isOurTeam=${isOurTeam} | ${time} P${period}`);
       }
 
       state.lastEventId = play.eventId;
     }
 
-    // Interpolation quand le jeu est en cours sans événement
-    if (state.clockRunning && newPlays.length === 0) {
-      const last = state.timerBuffer[state.timerBuffer.length - 1];
-      if (last?.clockRunning) {
-        const elapsedSec = Math.floor((now - last.realAt) / 1000);
-        const newTimeSec = Math.max(0, parseTime(last.timeInPeriod) - elapsedSec);
-        pushBuffer({
-          timeInPeriod: formatTime(newTimeSec),
-          period:       last.period,
-          realAt:       now,
-          clockRunning: true,
-          eventType:    'interpolated',
-        });
+    // Interpolation si jeu en cours et pas de nouveaux events
+    if (state.clockRunning && newPlays.length === 0 && state.buffer.length > 0) {
+      const last = state.buffer[state.buffer.length - 1];
+      if (last.clockRunning && last.period === state.period) {
+        const elapsed = Math.floor((now - last.realAt) / 1000);
+        if (elapsed > 0) {
+          const newSecs = Math.max(0, toSecs(last.timeInPeriod) - elapsed);
+          const m = Math.floor(newSecs / 60);
+          const s = newSecs % 60;
+          pushBuffer({
+            period: last.period,
+            timeInPeriod: `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`,
+            realAt: now,
+            clockRunning: true,
+          });
+        }
       }
     }
 
-    if (['FINAL', 'OFF'].includes(pbp.gameState)) {
-      console.log('[NHL] Partie terminée');
-      state.gameState = 'FINAL';
-      setTimeout(resetGame, 60000);
+    // Fin de partie
+    if (['FINAL','OFF'].includes(pbp.gameState)) {
+      console.log('[NHL] Partie terminée — reset dans 60s');
+      setTimeout(resetState, 60000);
     }
 
-    state.lastPollAt = now;
-
-  } catch (err) {
-    console.error('[Poll] Erreur:', err.message);
-  }
+  } catch(e) { /* erreurs réseau silencieuses */ }
 }
 
-function resetGame() {
-  Object.assign(state, {
-    gameId: null, gameState: 'IDLE', period: 0,
-    homeScore: 0, awayScore: 0, clockRunning: false,
-    timerBuffer: [], goals: [], lastGoalEventId: null, lastEventId: null,
-  });
-  console.log('[Game] Réinitialisé');
-}
+// ─── CALCUL DÉLAI TV ─────────────────────────────────────────
+// Algorithme simple: trouver l'entrée du buffer la plus proche
+// de tvTime pour la bonne période, puis calculer la différence
+// avec clickMs.
+function calcDelay(period, tvTime, clickMs) {
+  const tvSecs  = toSecs(tvTime);
+  const entries = state.buffer.filter(e => e.period === period);
 
-// ─── CALCUL DÉLAI TV ─────────────────────────────────────────────────────────
-function calcTvDelay(period, tvTime, clickMsRaw) {
-  let clickMs = Number(clickMsRaw);
-  if (clickMs < 10000000000) clickMs *= 1000; // secondes → ms
+  console.log(`[Sync] Calcul: P${period} tvTime=${tvTime}(${tvSecs}s) clickMs=${clickMs}`);
+  console.log(`[Sync] Buffer: ${state.buffer.length} total, ${entries.length} pour P${period}`);
 
-  const tvSecs    = parseTime(tvTime);
-  const buf       = state.timerBuffer;
-  const periodBuf = buf.filter(e => e.period === period);
+  if (entries.length === 0) return { ok: false, error: `Pas de données P${period}` };
 
-  // Log buffer pour debug
-  console.log(`[Sync Calc] clickMs=${clickMs} tvTime=${tvTime} tvSecs=${tvSecs} period=${period}`);
-  console.log(`[Sync Calc] buffer total=${buf.length} period_entries=${periodBuf.length}`);
-  if (periodBuf.length > 0) {
-    const first = periodBuf[0];
-    const last  = periodBuf[periodBuf.length - 1];
-    console.log(`[Sync Calc] period buffer range: ${first.timeInPeriod}(${first.realAt}) → ${last.timeInPeriod}(${last.realAt})`);
+  const first = entries[0];
+  const last  = entries[entries.length - 1];
+  console.log(`[Sync] Plage buffer P${period}: ${first.timeInPeriod} → ${last.timeInPeriod}`);
+
+  // Trouver l'entrée la plus proche de tvSecs
+  let best     = null;
+  let bestDiff = Infinity;
+  for (const e of entries) {
+    const diff = Math.abs(toSecs(e.timeInPeriod) - tvSecs);
+    if (diff < bestDiff) { bestDiff = diff; best = e; }
   }
 
-  if (!periodBuf.length) {
-    console.warn(`[Sync Calc] Aucune entrée pour P${period} → 45s par défaut`);
-    return { tvDelaySec: 45, confidence: 'low', note: `Aucune entrée P${period}` };
+  console.log(`[Sync] Meilleure entrée: ${best.timeInPeriod} realAt=${best.realAt} diff=${bestDiff}s`);
+
+  // Si trop loin → pas dans le buffer
+  if (bestDiff > 90) {
+    return { ok: false, error: `${tvTime} hors du buffer (entrée la plus proche: ${best.timeInPeriod})` };
   }
 
-  // Le buffer est trié par realAt croissant, et timeInPeriod DÉCROISSANT
-  // (ex: 20:00 → 19:45 → ... → 09:12 → ... → 00:00)
-  // On cherche deux entrées consécutives qui encadrent tvSecs:
-  //   entryBefore: timeInPeriod > tvSecs (avant dans le match, realAt plus petit)
-  //   entryAfter:  timeInPeriod < tvSecs (après dans le match, realAt plus grand)
-
-  let entryBefore = null; // chrono plus grand que tvSecs (réel plus tôt)
-  let entryAfter  = null; // chrono plus petit que tvSecs (réel plus tard)
-
-  for (const e of periodBuf) {
-    const t = parseTime(e.timeInPeriod);
-    if (t > tvSecs) entryBefore = e;      // garde le plus récent avec t > tvSecs
-    if (t <= tvSecs && !entryAfter) entryAfter = e; // prend le premier avec t <= tvSecs
-  }
-
-  console.log(`[Sync Calc] entryBefore=${entryBefore?.timeInPeriod}(${entryBefore?.realAt}) entryAfter=${entryAfter?.timeInPeriod}(${entryAfter?.realAt})`);
-
-  let realAtMs, note;
-
-  if (entryAfter && entryAfter.timeInPeriod === tvTime) {
-    // Correspondance exacte
-    realAtMs = entryAfter.realAt;
-    note     = 'exact';
-  } else if (entryBefore && entryAfter) {
-    // Interpolation linéaire entre les deux entrées encadrantes
-    // entryBefore: chrono plus grand, realAt plus petit
-    // entryAfter:  chrono plus petit, realAt plus grand
-    const timeBefore = parseTime(entryBefore.timeInPeriod);
-    const timeAfter  = parseTime(entryAfter.timeInPeriod);
-    const denom      = timeBefore - timeAfter; // toujours > 0
-    const ratio      = denom > 0 ? (timeBefore - tvSecs) / denom : 0;
-    realAtMs         = entryBefore.realAt + ratio * (entryAfter.realAt - entryBefore.realAt);
-    note             = 'interpolated';
-  } else if (entryAfter) {
-    realAtMs = entryAfter.realAt;
-    note     = entryAfter.clockRunning ? 'nearest' : 'stoppage';
-  } else if (entryBefore) {
-    realAtMs = entryBefore.realAt;
-    note     = 'nearest';
-  } else {
-    console.warn('[Sync Calc] Temps introuvable dans buffer → 45s');
-    return { tvDelaySec: 45, confidence: 'low', note: 'Temps introuvable' };
-  }
-
-  const HUMAN_REFLEX_MS = 250;
-  const delayMs  = clickMs - realAtMs - HUMAN_REFLEX_MS;
-  const delaySec = Math.round(delayMs / 1000);
-
-  console.log(`[Sync Calc] realAtMs=${realAtMs} delayMs=${delayMs} delaySec=${delaySec} note=${note}`);
+  const delaySec = Math.round((clickMs - best.realAt) / 1000);
+  console.log(`[Sync] delaySec=${delaySec}`);
 
   if (delaySec < 0 || delaySec > 120) {
-    console.warn(`[Sync Calc] Hors limites: ${delaySec}s → 45s par défaut`);
-    return { tvDelaySec: 45, confidence: 'low', note: `Hors limites: ${delaySec}s` };
+    return { ok: false, error: `Délai hors limites: ${delaySec}s` };
   }
 
-  console.log(`[Sync Calc] ✓ Délai TV = ${delaySec}s (${note})`);
   return {
-    tvDelaySec:  delaySec,
-    confidence:  note === 'exact' ? 'high' : note === 'interpolated' ? 'medium' : 'low',
-    note,
+    ok:         true,
+    tvDelaySec: delaySec,
+    confidence: bestDiff <= 10 ? 'high' : bestDiff <= 30 ? 'medium' : 'low',
+    note:       `nearest (diff ${bestDiff}s)`,
   };
 }
 
-// ─── ROUTES ──────────────────────────────────────────────────────────────────
+// ─── ROUTES ──────────────────────────────────────────────────
 
-// Poll principal ESP32
 app.get('/poll', (req, res) => {
   const lastGoal = state.goals.length > 0 ? state.goals[state.goals.length - 1] : null;
   res.json({
-    gameState:    state.gameState,
+    gameState:    state.gameId ? 'LIVE' : 'IDLE',
     period:       state.period,
     homeScore:    state.homeScore,
     awayScore:    state.awayScore,
     clockRunning: state.clockRunning,
     goal:         lastGoal,
-    teamId:       TEAM_ID,
     serverTime:   Date.now(),
   });
 });
 
-// Calcul délai TV
 app.get('/sync/calc', (req, res) => {
-  const period      = parseInt(req.query.period) || 1;
-  const tvTime      = req.query.tvTime || '';
-  const clickMsRaw  = req.query.clickMs;
-  const clickMsNum  = Number(clickMsRaw);
-  const nowMs       = Date.now();
+  const period  = parseInt(req.query.period) || 1;
+  const tvTime  = req.query.tvTime || '';
+  let   clickMs = Number(req.query.clickMs);
 
-  // ── DEBUG ──
-  const last = state.timerBuffer[state.timerBuffer.length - 1];
-  console.log('\n[Sync Debug] ===========================');
-  console.log(`[Sync Debug] period=${period} tvTime=${tvTime}`);
-  console.log(`[Sync Debug] clickMs_raw=${clickMsRaw}`);
-  console.log(`[Sync Debug] clickMs_number=${clickMsNum}`);
-  console.log(`[Sync Debug] now=${nowMs}`);
-  console.log(`[Sync Debug] diff_click_vs_now=${nowMs - clickMsNum}ms`);
-  console.log(`[Sync Debug] buffer_size=${state.timerBuffer.length}`);
-  if (last) {
-    console.log(`[Sync Debug] last_entry: time=${last.timeInPeriod} period=${last.period} realAt=${last.realAt}`);
-    console.log(`[Sync Debug] diff_click_vs_lastRealAt=${clickMsNum - last.realAt}ms`);
-  }
-  console.log('[Sync Debug] ===========================\n');
+  // Sécurité: clickMs en secondes → convertir en ms
+  if (clickMs > 0 && clickMs < 9999999999) clickMs *= 1000;
 
   if (!tvTime.match(/^\d{1,2}:\d{2}$/))
-    return res.status(400).json({ ok: false, error: 'tvTime invalide' });
+    return res.status(400).json({ ok: false, error: 'tvTime invalide (format MM:SS)' });
 
   if (!state.gameId)
-    return res.json({ ok: false, error: 'Aucune partie', tvDelaySec: 45 });
+    return res.json({ ok: false, error: 'Aucune partie en cours', tvDelaySec: 45 });
 
-  // Buffer doit avoir assez d'entrées en temps réel (min 30 = ~1 minute)
-  const realtimeEntries = state.timerBuffer.filter(e => !e.rebuilt);
-  if (realtimeEntries.length < 30) {
-    const wait = Math.ceil((30 - realtimeEntries.length) / 2);
-    console.log(`[Sync] Buffer insuffisant: ${realtimeEntries.length} entrées temps réel`);
-    return res.json({ ok: false, error: `Buffer en cours de remplissage, réessayez dans ~${wait}s`, tvDelaySec: 45 });
-  }
+  if (state.buffer.length < 10)
+    return res.json({ ok: false, error: 'Patientez 20s et réessayez', tvDelaySec: 45 });
 
-  const result = calcTvDelay(period, tvTime, clickMsRaw || nowMs);
-  res.json({ ok: true, ...result });
+  const result = calcDelay(period, tvTime, clickMs);
+
+  if (!result.ok)
+    return res.json({ ok: false, error: result.error, tvDelaySec: 45 });
+
+  res.json(result);
 });
 
-// Status
 app.get('/status', (req, res) => {
-  const last = state.timerBuffer[state.timerBuffer.length - 1];
+  const last = state.buffer[state.buffer.length - 1];
   res.json({
-    ok: true, gameId: state.gameId, gameState: state.gameState,
+    ok: true, gameId: state.gameId,
+    gameState: state.gameId ? 'LIVE' : 'IDLE',
     period: state.period, homeScore: state.homeScore, awayScore: state.awayScore,
-    clockRunning: state.clockRunning, bufferSize: state.timerBuffer.length,
-    lastTimer: last?.timeInPeriod || null, lastEventType: last?.eventType || null,
-    teamId: TEAM_ID, uptime: Math.floor(process.uptime()),
+    clockRunning: state.clockRunning, bufferSize: state.buffer.length,
+    lastTimer: last?.timeInPeriod || null, teamId: TEAM_ID,
+    uptime: Math.floor(process.uptime()),
   });
 });
 
-// ── NOUVEAU: Changer l'équipe depuis l'app ESP32 ──
-// L'ESP32 envoie le teamId choisi dans l'app → le serveur se met à jour
 app.post('/config/team', (req, res) => {
-  const newTeamId = parseInt(req.body.teamId);
-  if (!newTeamId || isNaN(newTeamId)) {
-    return res.status(400).json({ ok: false, error: 'teamId invalide' });
+  const id = parseInt(req.body.teamId);
+  if (!id || isNaN(id)) return res.status(400).json({ ok: false });
+  if (id !== TEAM_ID) {
+    TEAM_ID = id;
+    resetState();
+    console.log(`[Config] Équipe → ${TEAM_ID}`);
   }
-  const oldTeamId = TEAM_ID;
-  TEAM_ID = newTeamId;
-
-  // Si l'équipe change, réinitialiser la partie en cours
-  if (oldTeamId !== newTeamId) {
-    resetGame();
-    console.log(`[Config] Équipe changée: ${oldTeamId} → ${TEAM_ID}`);
-  }
-
   res.json({ ok: true, teamId: TEAM_ID });
 });
 
-// Ping
 app.get('/ping', (req, res) => res.json({ ok: true, time: Date.now() }));
 
-// Test but
 app.post('/test/goal', (req, res) => {
   const fake = {
-    eventId: 'TEST-' + Date.now(),
-    scoringTeamId: TEAM_ID,
-    isOurTeam: true,
-    period: state.period || 2,
-    timeInPeriod: '10:00',
-    homeScore: state.homeScore + 1,
-    awayScore: state.awayScore,
-    detectedAt: Date.now(),
-    test: true,
+    eventId: 'TEST-' + Date.now(), scoringTeamId: TEAM_ID, isOurTeam: true,
+    period: state.period || 1, timeInPeriod: '10:00',
+    homeScore: state.homeScore + 1, awayScore: state.awayScore,
+    detectedAt: Date.now(), test: true,
   };
   state.goals.push(fake);
   state.lastGoalEventId = fake.eventId;
@@ -468,28 +309,30 @@ app.post('/test/goal', (req, res) => {
   res.json({ ok: true, goal: fake });
 });
 
-// ─── DÉMARRAGE ───────────────────────────────────────────────────────────────
+// ─── DÉMARRAGE ───────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`\n🚨 GOAL LIGHT SERVER v4.0 — port ${PORT}`);
-  console.log(`   Équipe par défaut: ID ${TEAM_ID} | Poll: ${POLL_MS}ms\n`);
-
+  console.log(`\n🚨 GOAL LIGHT SERVER v5.0 — port ${PORT} — équipe ${TEAM_ID}\n`);
   try {
-    const game = await getTodaysGame();
+    const game = await findGame();
     if (game) {
-      state.gameId     = game.id;
-      state.gameState  = 'LIVE';
-      state.homeTeamId = game.homeTeam?.id;
-      state.awayTeamId = game.awayTeam?.id;
-      state.homeScore  = game.homeTeam?.score || 0;
-      state.awayScore  = game.awayTeam?.score || 0;
-      console.log(`[Démarrage] Partie en cours: ${state.gameId}`);
-      await rebuildBuffer(state.gameId);
+      state.gameId    = game.id;
+      state.homeScore = game.homeTeam?.score || 0;
+      state.awayScore = game.awayTeam?.score || 0;
+      const pbp   = await nhlGet(`/gamecenter/${state.gameId}/play-by-play`);
+      const plays = pbp.plays || [];
+      state.period    = pbp.periodDescriptor?.number || 0;
+      state.homeScore = pbp.homeTeam?.score ?? state.homeScore;
+      state.awayScore = pbp.awayTeam?.score ?? state.awayScore;
+      if (plays.length) {
+        state.lastEventId  = plays[plays.length - 1].eventId;
+        state.clockRunning = clockFor(plays[plays.length - 1].typeDescKey || '', false);
+      }
+      console.log(`[Démarrage] Partie: ${state.gameId} | P${state.period} | lastEvent=${state.lastEventId}`);
     } else {
-      console.log('[Démarrage] Aucune partie — attente...');
+      console.log('[Démarrage] Aucune partie — polling en attente...');
     }
-  } catch (e) {
-    console.log('[Démarrage] Erreur vérification initiale');
+  } catch(e) {
+    console.log('[Démarrage] Erreur:', e.message);
   }
-
-  pollingInterval = setInterval(poll, POLL_MS);
+  setInterval(poll, 2000);
 });
