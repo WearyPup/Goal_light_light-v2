@@ -135,17 +135,20 @@ async function poll() {
 
       // Détecter but
       if (type === 'goal' && play.eventId !== state.lastGoalEventId) {
-        const sid       = parseInt(play.details?.eventOwnerTeamId);
-        const isOurTeam = sid === parseInt(TEAM_ID);
+        const sid = parseInt(play.details?.eventOwnerTeamId);
         state.lastGoalEventId = play.eventId;
+        // Stocker TOUS les buts — chaque ESP32 filtre selon son équipe
         const goal = {
-          eventId: play.eventId, scoringTeamId: sid, isOurTeam,
-          period, timeInPeriod: time,
-          homeScore: state.homeScore, awayScore: state.awayScore,
-          detectedAt: now,
+          eventId:      play.eventId,
+          scoringTeamId: sid,       // L'ESP32 compare avec son cfg_teamId
+          period,
+          timeInPeriod: time,
+          homeScore:    state.homeScore,
+          awayScore:    state.awayScore,
+          detectedAt:   now,
         };
         state.goals.push(goal);
-        console.log(`[GOAL] Équipe ${sid} isOurTeam=${isOurTeam} | ${time} P${period}`);
+        console.log(`[GOAL] But équipe ${sid} | ${time} P${period}`);
       }
 
       state.lastEventId = play.eventId;
@@ -163,6 +166,8 @@ async function poll() {
 // ─── ROUTES ──────────────────────────────────────────────────
 
 // Poll ESP32 — appelé toutes les secondes
+// Le serveur envoie TOUS les buts avec scoringTeamId
+// Chaque ESP32 filtre lui-même selon son équipe configurée
 app.get('/poll', (req, res) => {
   const lastGoal = state.goals.length > 0 ? state.goals[state.goals.length - 1] : null;
   res.json({
@@ -171,7 +176,7 @@ app.get('/poll', (req, res) => {
     homeScore:    state.homeScore,
     awayScore:    state.awayScore,
     clockRunning: state.clockRunning,
-    goal:         lastGoal,
+    goal:         lastGoal, // contient scoringTeamId — filtrage côté ESP32
     serverTime:   Date.now(),
   });
 });
@@ -193,16 +198,10 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Changer équipe
+// /config/team gardé pour compatibilité mais n'affecte plus la détection
+// Le serveur détecte TOUS les buts — filtrage côté ESP32
 app.post('/config/team', (req, res) => {
-  const id = parseInt(req.body.teamId);
-  if (!id || isNaN(id)) return res.status(400).json({ ok: false });
-  if (id !== TEAM_ID) {
-    TEAM_ID = id;
-    resetState();
-    console.log(`[Config] Équipe → ${TEAM_ID}`);
-  }
-  res.json({ ok: true, teamId: TEAM_ID });
+  res.json({ ok: true });
 });
 
 // Test but
@@ -220,6 +219,168 @@ app.post('/test/goal', (req, res) => {
 });
 
 app.get('/ping', (req, res) => res.json({ ok: true, time: Date.now() }));
+
+// Historique des appareils connectés
+const devices = {}; // { deviceId: { lastSeen, teamId, goalCount, lastGoal } }
+
+// Middleware pour tracker les appareils
+app.use((req, res, next) => {
+  const deviceId = req.headers['x-device'];
+  const teamId   = req.query.teamId || req.body?.teamId;
+  if (deviceId) {
+    if (!devices[deviceId]) devices[deviceId] = { goalCount: 0 };
+    devices[deviceId].lastSeen = Date.now();
+    if (teamId) devices[deviceId].teamId = teamId;
+  }
+  next();
+});
+
+// Dashboard — état des matchs en temps réel, refresh 2s via fetch
+app.get('/dashboard', (req, res) => {
+  res.send(`<!DOCTYPE html><html><head>
+<meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>GoalLight</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0D0D0D;color:#F0F0F0;font-family:system-ui,sans-serif;min-height:100vh}
+header{background:linear-gradient(135deg,#8B0000,#C8102E);padding:16px 20px;display:flex;align-items:center;gap:12px}
+header h1{font-size:20px;font-weight:900;letter-spacing:4px;text-transform:uppercase}
+.sub{font-size:10px;opacity:.6;letter-spacing:2px;margin-top:2px}
+.con{padding:16px;display:flex;flex-direction:column;gap:12px;max-width:600px;margin:0 auto}
+.card{background:#181818;border:1px solid #282828;border-radius:12px;overflow:hidden}
+.ch{padding:11px 16px 8px;border-bottom:1px solid #282828;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#606060}
+.cb{padding:14px}
+.score{font-size:48px;font-weight:900;text-align:center;letter-spacing:4px;color:#F0F0F0;line-height:1;padding:10px 0}
+.teams{display:flex;justify-content:space-between;font-size:12px;color:#606060;margin-top:4px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.stat{background:#111;border-radius:8px;padding:10px;text-align:center}
+.sv{font-size:22px;font-weight:900;line-height:1}
+.sv.live{color:#1DB954}.sv.idle{color:#444}
+.sv.red{color:#C8102E}
+.sl{font-size:9px;color:#606060;letter-spacing:1.5px;text-transform:uppercase;margin-top:4px}
+.goals{display:flex;flex-direction:column;gap:6px}
+.goal-row{background:#111;border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:10px}
+.goal-row.new{border-left:3px solid #1DB954;animation:flash 1s ease}
+@keyframes flash{0%,100%{background:#111}50%{background:#0d2a14}}
+.team-badge{background:#C8102E;color:#fff;border-radius:6px;padding:3px 8px;font-size:11px;font-weight:700;flex-shrink:0}
+.goal-info{flex:1;font-size:13px}
+.goal-time{font-size:11px;color:#606060}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-right:4px}
+.dot.on{background:#1DB954;box-shadow:0 0 8px #1DB954;animation:bl 1s infinite}
+.dot.off{background:#444}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:.3}}
+.status-bar{display:flex;align-items:center;gap:6px;font-size:11px;color:#606060;padding:8px 16px;background:#111;border-bottom:1px solid #282828}
+.empty{color:#444;text-align:center;padding:20px;font-size:13px}
+</style></head><body>
+<header><div>
+  <h1>🚨 Goal Light</h1>
+  <div class='sub'>DASHBOARD ADMIN</div>
+</div></header>
+<div class='status-bar'>
+  <span class='dot' id='sdot'></span>
+  <span id='stxt'>Connexion...</span>
+  <span style='margin-left:auto;font-size:10px' id='upd'></span>
+</div>
+<div class='con'>
+
+  <div class='card'>
+    <div class='ch'>Match en cours</div>
+    <div class='cb'>
+      <div class='score' id='score'>–</div>
+      <div class='teams'><span id='away'>–</span><span id='home'>–</span></div>
+      <div class='g3' style='margin-top:12px'>
+        <div class='stat'><div class='sv' id='gstate'>–</div><div class='sl'>État</div></div>
+        <div class='stat'><div class='sv red' id='period'>–</div><div class='sl'>Période</div></div>
+        <div class='stat'><div class='sv' id='clock'>–</div><div class='sl'>Chrono</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class='card'>
+    <div class='ch'>Buts détectés</div>
+    <div class='cb'><div class='goals' id='goals'><div class='empty'>Aucun but</div></div></div>
+  </div>
+
+</div>
+<script>
+var lastGoalId = null;
+var lastGoalCount = 0;
+
+function fmt(ms) {
+  var s = Math.round((Date.now() - ms) / 1000);
+  if (s < 60) return s + 's';
+  return Math.floor(s/60) + 'm' + (s%60) + 's';
+}
+
+function refresh() {
+  fetch('/api/dashboard')
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      // Status
+      document.getElementById('sdot').className = 'dot on';
+      document.getElementById('stxt').textContent = 'Connecté · Render';
+      document.getElementById('upd').textContent = 'Mis à jour: ' + new Date().toLocaleTimeString();
+
+      // Match
+      if (d.gameId) {
+        document.getElementById('score').textContent = d.awayScore + ' – ' + d.homeScore;
+        document.getElementById('gstate').textContent = d.gameState;
+        document.getElementById('gstate').className = 'sv live';
+        document.getElementById('period').textContent = 'P' + d.period;
+        document.getElementById('clock').textContent = d.lastTimer || '–';
+      } else {
+        document.getElementById('score').textContent = '–';
+        document.getElementById('gstate').textContent = 'IDLE';
+        document.getElementById('gstate').className = 'sv idle';
+        document.getElementById('period').textContent = '–';
+        document.getElementById('clock').textContent = '–';
+      }
+
+      // Buts
+      var goals = d.goals || [];
+      if (goals.length === 0) {
+        document.getElementById('goals').innerHTML = '<div class=\'empty\'>Aucun but</div>';
+      } else {
+        var html = '';
+        goals.forEach(function(g, i) {
+          var isNew = i === 0 && g.eventId !== lastGoalId;
+          html += '<div class=\'goal-row' + (isNew ? ' new' : '') + '\'>';
+          html += '<span class=\'team-badge\'>Équipe ' + g.scoringTeamId + '</span>';
+          html += '<div class=\'goal-info\'>P' + g.period + ' · ' + g.timeInPeriod + '</div>';
+          html += '<span class=\'goal-time\'>' + fmt(g.detectedAt) + '</span>';
+          html += '</div>';
+        });
+        document.getElementById('goals').innerHTML = html;
+        if (goals.length > 0) lastGoalId = goals[0].eventId;
+      }
+    })
+    .catch(function() {
+      document.getElementById('sdot').className = 'dot off';
+      document.getElementById('stxt').textContent = 'Hors ligne';
+    });
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script></body></html>`);
+});
+
+// API pour le dashboard
+app.get('/api/dashboard', (req, res) => {
+  const last = state.buffer ? state.buffer[state.buffer.length - 1] : null;
+  res.json({
+    gameId:     state.gameId,
+    gameState:  state.gameId ? 'LIVE' : 'IDLE',
+    period:     state.period,
+    homeScore:  state.homeScore,
+    awayScore:  state.awayScore,
+    clockRunning: state.clockRunning,
+    lastTimer:  last?.timeInPeriod || null,
+    goals:      state.goals.slice(-10).reverse(),
+    uptime:     Math.floor(process.uptime()),
+  });
+});
 
 // ─── DÉMARRAGE ───────────────────────────────────────────────
 app.listen(PORT, async () => {
