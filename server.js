@@ -56,44 +56,37 @@ async function findGame() {
   const now   = new Date();
   const today = now.toISOString().slice(0, 10);
   const yest  = new Date(now - 86400000).toISOString().slice(0, 10);
-  console.log(`[NHL] Recherche parties: ${yest} et ${today} | équipe: ${TEAM_ID}`);
+  console.log(`[NHL] Recherche parties en cours: ${yest} et ${today}`);
   let games = [];
   for (const d of [today, yest]) {
     try {
       const data = await nhlGet(`/schedule/${d}`);
       const g = (data.gameWeek || []).flatMap(w => w.games || []);
-      console.log(`[NHL] ${d}: ${g.length} parties trouvées`);
-      g.forEach(p => console.log(`  → ${p.id} | ${p.awayTeam?.id} vs ${p.homeTeam?.id} | ${p.gameState}`));
       games = games.concat(g);
     } catch(e) {
       console.error(`[NHL] Erreur schedule ${d}:`, e.message);
     }
   }
-  const game = games.find(g =>
-    (g.homeTeam?.id === TEAM_ID || g.awayTeam?.id === TEAM_ID) &&
-    !['OFF','FINAL','FUT','PRE'].includes(g.gameState)
-  );
-  if (game) {
-    console.log(`[NHL] Partie trouvée: ${game.id} | état: ${game.gameState}`);
-  } else {
-    console.log(`[NHL] Aucune partie en cours pour équipe ${TEAM_ID}`);
-  }
-  return game || null;
+  // Trouver N'IMPORTE QUELLE partie en cours — pas besoin de filtrer par équipe
+  // L'ESP32 filtre lui-même selon son équipe configurée
+  const live = games.filter(g => !['OFF','FINAL','FUT','PRE'].includes(g.gameState));
+  console.log(`[NHL] ${live.length} partie(s) en cours: ${live.map(g => g.id+' ('+g.gameState+')').join(', ') || 'aucune'}`);
+  // Prendre la première partie en cours
+  return live[0] || null;
 }
 
 // ─── POLLING ─────────────────────────────────────────────────
 async function poll() {
   try {
-    // Chercher partie
+    // Chercher partie en cours (n'importe quelle équipe)
     if (!state.gameId) {
       const game = await findGame();
       if (!game) return;
       state.gameId    = game.id;
       state.homeScore = game.homeTeam?.score || 0;
       state.awayScore = game.awayTeam?.score || 0;
-      console.log(`[NHL] Partie: ${state.gameId} équipe=${TEAM_ID}`);
-      // Mémoriser dernier eventId pour ne traiter que les nouveaux
-      const pbp = await nhlGet(`/gamecenter/${state.gameId}/play-by-play`);
+      console.log(`[NHL] Partie: ${state.gameId} | ${game.awayTeam?.id} vs ${game.homeTeam?.id}`);
+      const pbp   = await nhlGet(`/gamecenter/${state.gameId}/play-by-play`);
       const plays = pbp.plays || [];
       state.period    = pbp.periodDescriptor?.number || 0;
       state.homeScore = pbp.homeTeam?.score ?? state.homeScore;
@@ -101,24 +94,8 @@ async function poll() {
       if (plays.length) {
         state.lastEventId  = plays[plays.length - 1].eventId;
         state.clockRunning = clockFor(plays[plays.length - 1].typeDescKey || '', false);
-        // Vérifier si dernier event est un but pour notre équipe
-        const lastGoalPlay = [...plays].reverse().find(p => p.typeDescKey === 'goal');
-        if (lastGoalPlay && lastGoalPlay.eventId !== state.lastGoalEventId) {
-          const sid = parseInt(lastGoalPlay.details?.eventOwnerTeamId);
-          if (sid === parseInt(TEAM_ID)) {
-            state.lastGoalEventId = lastGoalPlay.eventId;
-            state.goals.push({
-              eventId: lastGoalPlay.eventId, scoringTeamId: sid, isOurTeam: true,
-              period: lastGoalPlay.periodDescriptor?.number || 0,
-              timeInPeriod: lastGoalPlay.timeInPeriod || '',
-              homeScore: state.homeScore, awayScore: state.awayScore,
-              detectedAt: Date.now(),
-            });
-            console.log(`[GOAL] But au démarrage: P${lastGoalPlay.periodDescriptor?.number} ${lastGoalPlay.timeInPeriod}`);
-          }
-        }
       }
-      console.log(`[NHL] Reprise P${state.period} | lastEventId=${state.lastEventId}`);
+      console.log(`[NHL] Reprise P${state.period} score: ${state.awayScore}-${state.homeScore}`);
       return;
     }
 
@@ -147,18 +124,18 @@ async function poll() {
       if (type === 'goal' && play.eventId !== state.lastGoalEventId) {
         const sid = parseInt(play.details?.eventOwnerTeamId);
         state.lastGoalEventId = play.eventId;
-        // Stocker TOUS les buts — chaque ESP32 filtre selon son équipe
+        // Stocker TOUS les buts — l'ESP32 filtre selon son équipe
         const goal = {
-          eventId:      play.eventId,
-          scoringTeamId: sid,       // L'ESP32 compare avec son cfg_teamId
+          eventId:       play.eventId,
+          scoringTeamId: sid,
           period,
-          timeInPeriod: time,
-          homeScore:    state.homeScore,
-          awayScore:    state.awayScore,
-          detectedAt:   now,
+          timeInPeriod:  time,
+          homeScore:     state.homeScore,
+          awayScore:     state.awayScore,
+          detectedAt:    now,
         };
         state.goals.push(goal);
-        console.log(`[GOAL] But équipe ${sid} | ${time} P${period}`);
+        console.log(`[GOAL] But equipe ${sid} | ${time} P${period} | score: ${state.awayScore}-${state.homeScore}`);
       }
 
       state.lastEventId = play.eventId;
