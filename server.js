@@ -56,18 +56,28 @@ async function findGame() {
   const now   = new Date();
   const today = now.toISOString().slice(0, 10);
   const yest  = new Date(now - 86400000).toISOString().slice(0, 10);
-  let games   = [];
+  console.log(`[NHL] Recherche parties: ${yest} et ${today} | équipe: ${TEAM_ID}`);
+  let games = [];
   for (const d of [today, yest]) {
     try {
       const data = await nhlGet(`/schedule/${d}`);
-      games = games.concat((data.gameWeek || []).flatMap(w => w.games || []));
-    } catch(e) {}
+      const g = (data.gameWeek || []).flatMap(w => w.games || []);
+      console.log(`[NHL] ${d}: ${g.length} parties trouvées`);
+      g.forEach(p => console.log(`  → ${p.id} | ${p.awayTeam?.id} vs ${p.homeTeam?.id} | ${p.gameState}`));
+      games = games.concat(g);
+    } catch(e) {
+      console.error(`[NHL] Erreur schedule ${d}:`, e.message);
+    }
   }
   const game = games.find(g =>
     (g.homeTeam?.id === TEAM_ID || g.awayTeam?.id === TEAM_ID) &&
     !['OFF','FINAL','FUT','PRE'].includes(g.gameState)
   );
-  if (game) console.log(`[NHL] Parties dispo: ${games.filter(g=>!['OFF','FINAL','FUT','PRE'].includes(g.gameState)).map(g=>g.id).join(', ')}`);
+  if (game) {
+    console.log(`[NHL] Partie trouvée: ${game.id} | état: ${game.gameState}`);
+  } else {
+    console.log(`[NHL] Aucune partie en cours pour équipe ${TEAM_ID}`);
+  }
   return game || null;
 }
 
