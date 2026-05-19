@@ -2,7 +2,7 @@
  * GOAL LIGHT SERVER v6.0
  * - Poll NHL API toutes les 2s
  * - Détection but fiable (parseInt)
- * - TEAM_ID configurable via POST /config/team
+
  * - Pas de synchro complexe — délai géré côté ESP32
  */
 
@@ -17,7 +17,6 @@ app.use(express.json());
 const PORT    = process.env.PORT || 3000;
 const NHL_API = 'https://api-web.nhle.com/v1';
 
-let TEAM_ID = parseInt(process.env.TEAM_ID || '8');
 
 // ─── ÉTAT ────────────────────────────────────────────────────
 const state = {
@@ -180,7 +179,6 @@ app.get('/status', (req, res) => {
     clockRunning: state.clockRunning,
     goalsCount:  state.goals.length,
     lastGoal:    state.goals.length > 0 ? state.goals[state.goals.length - 1] : null,
-    teamId:      TEAM_ID,
     uptime:      Math.floor(process.uptime()),
   });
 });
@@ -194,7 +192,7 @@ app.post('/config/team', (req, res) => {
 // Test but
 app.post('/test/goal', (req, res) => {
   const fake = {
-    eventId: 'TEST-' + Date.now(), scoringTeamId: TEAM_ID, isOurTeam: true,
+    eventId: 'TEST-' + Date.now(), scoringTeamId: 0, isOurTeam: true,
     period: state.period || 1, timeInPeriod: '10:00',
     homeScore: state.homeScore + 1, awayScore: state.awayScore,
     detectedAt: Date.now(), test: true,
@@ -371,7 +369,7 @@ app.get('/api/dashboard', (req, res) => {
 
 // ─── DÉMARRAGE ───────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`\n🚨 GOAL LIGHT SERVER v6.0 — port ${PORT} — équipe ${TEAM_ID}\n`);
+  console.log(`\n🚨 GOAL LIGHT SERVER v7.0 — port ${PORT}\n`);
   try {
     const game = await findGame();
     if (game) {
