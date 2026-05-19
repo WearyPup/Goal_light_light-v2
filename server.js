@@ -93,8 +93,26 @@ async function poll() {
       if (plays.length) {
         state.lastEventId  = plays[plays.length - 1].eventId;
         state.clockRunning = clockFor(plays[plays.length - 1].typeDescKey || '', false);
+
+        // Vérifier le dernier but — s'il vient d'être marqué (< 60s), le mettre en file
+        const lastGoalPlay = [...plays].reverse().find(p => p.typeDescKey === 'goal');
+        if (lastGoalPlay) {
+          const sid = parseInt(lastGoalPlay.details?.eventOwnerTeamId);
+          state.lastGoalEventId = lastGoalPlay.eventId;
+          const goal = {
+            eventId:       lastGoalPlay.eventId,
+            scoringTeamId: sid,
+            period:        lastGoalPlay.periodDescriptor?.number || state.period,
+            timeInPeriod:  lastGoalPlay.timeInPeriod || '',
+            homeScore:     state.homeScore,
+            awayScore:     state.awayScore,
+            detectedAt:    Date.now(),
+          };
+          state.goals.push(goal);
+          console.log(`[Démarrage] Dernier but: équipe ${sid} | P${goal.period} ${goal.timeInPeriod}`);
+        }
       }
-      console.log(`[NHL] Reprise P${state.period} score: ${state.awayScore}-${state.homeScore}`);
+      console.log(`[NHL] Reprise P${state.period || '?'} score: ${state.awayScore}-${state.homeScore} | lastEventId=${state.lastEventId}`);
       return;
     }
 
@@ -102,15 +120,30 @@ async function poll() {
     const plays = pbp.plays || [];
     const now   = Date.now();
 
+    const prevHome = state.homeScore;
+    const prevAway = state.awayScore;
+
     state.period    = pbp.periodDescriptor?.number ?? state.period;
     state.homeScore = pbp.homeTeam?.score           ?? state.homeScore;
     state.awayScore = pbp.awayTeam?.score           ?? state.awayScore;
+
+    // Détection de but par changement de score — filet de sécurité
+    // Si le score a changé mais qu'on n'a pas vu l'événement goal
+    const scoreDiff = (state.homeScore + state.awayScore) - (prevHome + prevAway);
+    if (scoreDiff > 0) {
+      console.log(`[Score] Changement détecté: ${prevAway}-${prevHome} → ${state.awayScore}-${state.homeScore}`);
+    }
 
     // Nouveaux plays seulement
     const lastIdx  = state.lastEventId
       ? plays.findIndex(p => p.eventId === state.lastEventId)
       : -1;
-    const newPlays = lastIdx >= 0 ? plays.slice(lastIdx + 1) : [];
+    const newPlays = lastIdx >= 0 ? plays.slice(lastIdx + 1) : plays.slice(-5);
+
+    if (newPlays.length > 0) {
+      console.log(`[Poll] ${newPlays.length} nouveaux plays | lastIdx=${lastIdx} | total=${plays.length}`);
+      newPlays.forEach(p => console.log(`  → ${p.typeDescKey} | ${p.timeInPeriod} | eventId=${p.eventId}`));
+    }
 
     for (const play of newPlays) {
       const type   = play.typeDescKey || '';
@@ -138,6 +171,30 @@ async function poll() {
       }
 
       state.lastEventId = play.eventId;
+    }
+
+    // Filet de sécurité — si score a changé mais aucun goal détecté dans les plays
+    const totalPrev = prevHome + prevAway;
+    const totalNow  = state.homeScore + state.awayScore;
+    if (totalNow > totalPrev && state.goals.length === 0 ||
+        totalNow > totalPrev && state.goals[state.goals.length-1]?.detectedAt < now - 10000) {
+      // Trouver quel équipe a marqué depuis les plays
+      const lastGoalPlay = [...plays].reverse().find(p => p.typeDescKey === 'goal');
+      if (lastGoalPlay && lastGoalPlay.eventId !== state.lastGoalEventId) {
+        const sid = parseInt(lastGoalPlay.details?.eventOwnerTeamId);
+        state.lastGoalEventId = lastGoalPlay.eventId;
+        const goal = {
+          eventId:       lastGoalPlay.eventId,
+          scoringTeamId: sid,
+          period:        lastGoalPlay.periodDescriptor?.number || state.period,
+          timeInPeriod:  lastGoalPlay.timeInPeriod || '',
+          homeScore:     state.homeScore,
+          awayScore:     state.awayScore,
+          detectedAt:    now,
+        };
+        state.goals.push(goal);
+        console.log(`[GOAL] Détecté via score! Équipe ${sid} | P${goal.period} ${goal.timeInPeriod}`);
+      }
     }
 
     // Fin de partie
@@ -384,8 +441,25 @@ app.listen(PORT, async () => {
       if (plays.length) {
         state.lastEventId  = plays[plays.length - 1].eventId;
         state.clockRunning = clockFor(plays[plays.length - 1].typeDescKey || '', false);
+
+        // Dernier but de la partie — l'ESP32 décidera si c'est son équipe
+        const lastGoalPlay = [...plays].reverse().find(p => p.typeDescKey === 'goal');
+        if (lastGoalPlay) {
+          const sid = parseInt(lastGoalPlay.details?.eventOwnerTeamId);
+          state.lastGoalEventId = lastGoalPlay.eventId;
+          state.goals.push({
+            eventId:       lastGoalPlay.eventId,
+            scoringTeamId: sid,
+            period:        lastGoalPlay.periodDescriptor?.number || state.period,
+            timeInPeriod:  lastGoalPlay.timeInPeriod || '',
+            homeScore:     state.homeScore,
+            awayScore:     state.awayScore,
+            detectedAt:    Date.now(),
+          });
+          console.log(`[Démarrage] Dernier but mémorisé: équipe ${sid}`);
+        }
       }
-      console.log(`[Démarrage] Partie: ${state.gameId} | P${state.period} | score: ${state.homeScore}-${state.awayScore}`);
+      console.log(`[Démarrage] Partie: ${state.gameId} | P${state.period || '?'} | score: ${state.awayScore}-${state.homeScore}`);
     } else {
       console.log('[Démarrage] Aucune partie — polling en attente...');
     }
